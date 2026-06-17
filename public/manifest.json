@@ -1,0 +1,28 @@
+{
+  "manifestVersion": 1,
+  "id": "remzot",
+  "name": "Remzot",
+  "author": "Mo9",
+  "repoUrl": "https://github.com/msf999/remzot",
+  "version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "theme": [],
+  "enableOnMobile": false,
+  "unlisted": true,
+  "description": "Sync your Zotero library into Remnote — metadata, collections, two-way tag sync, and an on-page menu with references, citations & related papers.",
+  "requestNative": false,
+  "requiredScopes": [
+    {
+      "type": "All",
+      "level": "ReadCreateModify"
+    },
+    {
+      "type": "DescendantsOfName",
+      "remName": "Zotero",
+      "level": "ReadCreateModifyDelete"
+    }
+  ]
+}
