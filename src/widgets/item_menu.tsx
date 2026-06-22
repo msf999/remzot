@@ -34,8 +34,10 @@ import { fetchItemByKey } from '../lib/zoteroApi';
 import {
   encodeDoiPath,
   fetchAllSources,
+  fetchJournalMetric,
   fetchPaperMetrics,
   fetchSciteTallies,
+  type JournalMetric,
   type MultiSourceResult,
   normalizeDoi,
   type PaperMetrics,
@@ -891,6 +893,9 @@ function ItemMenu() {
   // Importance metrics (influential cites / top-percentile / retracted / related-in-library) per row,
   // by normalized DOI — fetched in the same off-critical-path effect as scite.
   const [metricsMap, setMetricsMap] = useState<Map<string, PaperMetrics>>(new Map());
+  // Journal-level 2-yr mean citedness (OpenAlex) for the FOCUS paper's venue — fetched in the same
+  // off-critical-path effect; null while loading / no DOI / no source / no stat.
+  const [journalMetric, setJournalMetric] = useState<JournalMetric | null>(null);
   // List toolbar + Add state (lifted here so the toolbar above the list can drive the same list).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState('');
@@ -1025,6 +1030,7 @@ function ItemMenu() {
     if (!doi) {
       setSciteMap(new Map());
       setMetricsMap(new Map());
+      setJournalMetric(null);
       return;
     }
     let cancelled = false;
@@ -1033,6 +1039,11 @@ function ItemMenu() {
     if (res) for (const p of [...res.references, ...res.citations, ...res.related]) if (p.doi) dois.push(p.doi);
     void fetchSciteTallies(dois).then((m) => {
       if (!cancelled) setSciteMap(m);
+    });
+    // Focus paper's journal metric (venue-level, so just the one DOI; not the rows).
+    setJournalMetric(null);
+    void fetchJournalMetric(doi).then((j) => {
+      if (!cancelled) setJournalMetric(j);
     });
     // Metrics only matter for the rows, so skip until the lists' DOIs are loaded.
     if (res) {
@@ -1209,7 +1220,7 @@ function ItemMenu() {
 
   const syncDate = formatSyncDate(data.lastSyncedAt);
   const syncLabel = syncing ? 'Syncing…' : 'Sync';
-  const syncCaption = data.lastSyncedAt ? `synced ${syncDate}` : 'never synced';
+  const syncCaption = data.lastSyncedAt ? syncDate : 'never synced';
   const syncTitle = syncing
     ? 'Syncing this item with Zotero…'
     : `${
@@ -1382,6 +1393,8 @@ function ItemMenu() {
 
   // scite tally for the focus paper (the header pill) — undefined while loading / no scite record.
   const focusTally = data.doi ? sciteMap.get(normalizeDoi(data.doi)) : undefined;
+  // The focus paper's own importance metrics (already fetched — its DOI leads the metrics batch).
+  const focusMetrics = data.doi ? metricsMap.get(normalizeDoi(data.doi)) : undefined;
   // The always-visible external-link icons (brand logos). `icon` keys into BRAND_ICONS; no-DOI links
   // (Semantic Scholar / OpenAlex / Inciteful) fade in place.
   const brandLinks: ExternalLink[] = [
@@ -1417,22 +1430,68 @@ function ItemMenu() {
               <BrandLink key={l.icon} {...l} />
             ))}
           </span>
-          {/* The scite pill: inline scite counts once loaded; otherwise a quiet "scite" link to the
-              report (no-record DOIs included). */}
-          {data.doi && (
-            <span>
-              {focusTally ? (
-                <SciteRowCounts tally={focusTally} doi={data.doi} />
-              ) : (
-                <a
-                  href={`https://scite.ai/reports/${encodeDoiPath(data.doi)}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="rn-clr-content-tertiary text-xs no-underline hover:underline"
-                  title="scite.ai Smart Citations — click for the report"
+          {/* scite pill + focus-paper importance metrics + journal metric, grouped so they sit together
+              on one line (wrap as a unit). */}
+          {(data.doi || journalMetric) && (
+            <span className="rn-clr-content-tertiary flex flex-wrap items-center" style={{ columnGap: '0.5rem', rowGap: '0.2rem' }}>
+              {/* ⚠ Retracted — highest-signal; only renders when flagged. */}
+              {focusMetrics?.retracted && (
+                <span
+                  className="inline-flex items-center gap-1 font-semibold"
+                  style={{ color: 'var(--rn-clr-content-negative, #dc2626)', whiteSpace: 'nowrap' }}
+                  title="Flagged as retracted (OpenAlex) — do not cite"
                 >
-                  scite
-                </a>
+                  <Icon name="warn" size={12} /> Retracted
+                </span>
+              )}
+              {/* (N influential) — Semantic Scholar influential citations. */}
+              {focusMetrics && focusMetrics.influential > 0 && (
+                <span
+                  className="text-xs"
+                  style={{ whiteSpace: 'nowrap' }}
+                  title="Influential citations — citing papers that meaningfully built on this one (Semantic Scholar)"
+                >
+                  ({focusMetrics.influential.toLocaleString()} influential)
+                </span>
+              )}
+              {/* ★ top 1%/10% — age-fair importance (OpenAlex percentile). */}
+              {focusMetrics?.topPercent && (
+                <span
+                  className="text-xs"
+                  style={{ color: 'var(--rn-clr-content-positive, #16a34a)', whiteSpace: 'nowrap' }}
+                  title={`Top ${focusMetrics.topPercent}% most-cited of its publication year (OpenAlex)`}
+                >
+                  ★ top {focusMetrics.topPercent}%
+                </span>
+              )}
+              {/* The scite pill: inline scite counts once loaded; otherwise a quiet "scite" link to the
+                  report (no-record DOIs included). */}
+              {data.doi &&
+                (focusTally ? (
+                  <SciteRowCounts tally={focusTally} doi={data.doi} />
+                ) : (
+                  <a
+                    href={`https://scite.ai/reports/${encodeDoiPath(data.doi)}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rn-clr-content-tertiary text-xs no-underline hover:underline"
+                    title="scite.ai Smart Citations — click for the report"
+                  >
+                    scite
+                  </a>
+                ))}
+              {/* Journal metric: OpenAlex 2-yr mean citedness for THIS paper's venue (impact-factor-like,
+                  NOT the trademarked Clarivate JIF). */}
+              {journalMetric && (
+                <span
+                  className="rn-clr-content-tertiary text-xs"
+                  style={{ whiteSpace: 'nowrap' }}
+                  title={`OpenAlex 2-year mean citedness${
+                    journalMetric.journal ? ` — ${journalMetric.journal}` : ''
+                  } (an impact-factor-like metric, not the Clarivate JIF)`}
+                >
+                  📊 {journalMetric.value.toFixed(1)} journal
+                </span>
               )}
             </span>
           )}

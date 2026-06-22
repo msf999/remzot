@@ -917,6 +917,63 @@ export async function fetchPaperMetrics(dois: string[], plugin: RNPlugin): Promi
   return out;
 }
 
+// ───────────────────────── Journal metric (venue 2-yr mean citedness) ─────────────────────────
+
+/** A journal's OpenAlex 2-year mean citedness — the impact-factor formula computed over OpenAlex's
+ *  corpus, NOT the trademarked Clarivate JIF — plus the journal name (for the tooltip). */
+export interface JournalMetric {
+  /** OpenAlex summary_stats.2yr_mean_citedness for the paper's primary source (journal). > 0. */
+  value: number;
+  /** The journal / source display name ('' if unknown). */
+  journal: string;
+}
+
+/** doi → OpenAlex source id ('' = resolved, no source); skips the work fetch on revisit. */
+const sourceIdByDoi = new Map<string, string>();
+/** OpenAlex source id → its journal metric (null = no usable stat); journal metrics are ~yearly-stable. */
+const journalMetricBySource = new Map<string, JournalMetric | null>();
+
+/** The journal-level 2-year mean citedness for a paper's venue, via OpenAlex: the work's
+ *  primary_location.source id → that source's summary_stats. Two module-cached calls (doi→source id,
+ *  source→stat; source metrics are stable). Returns null when there's no DOI, no primary source, or no
+ *  usable stat. Never throws; transient (non-200/network) failures are left UNcached so a revisit retries. */
+export async function fetchJournalMetric(doi: string): Promise<JournalMetric | null> {
+  const d = normalizeDoi(doi);
+  if (!d) return null;
+  try {
+    // 1) doi → source id (cached, incl. '' = no source).
+    let sid = sourceIdByDoi.get(d);
+    if (sid === undefined) {
+      const wr = await fetch(`https://api.openalex.org/works/doi:${encodeDoiPath(d)}?select=primary_location`, {
+        headers: { Accept: 'application/json' },
+      });
+      if (!wr.ok) return null; // transient — don't cache.
+      const wj = (await wr.json()) as { primary_location?: { source?: { id?: string | null } | null } | null };
+      sid = oaId(wj.primary_location?.source?.id);
+      sourceIdByDoi.set(d, sid);
+    }
+    if (!sid) return null; // no journal/source (e.g. a preprint server with no source record).
+
+    // 2) source id → metric (cached, incl. null = no usable stat).
+    if (journalMetricBySource.has(sid)) return journalMetricBySource.get(sid) ?? null;
+    const sr = await fetch(`https://api.openalex.org/sources/${sid}?select=display_name,summary_stats`, {
+      headers: { Accept: 'application/json' },
+    });
+    if (!sr.ok) return null; // transient — don't cache.
+    const sj = (await sr.json()) as {
+      display_name?: string | null;
+      summary_stats?: { '2yr_mean_citedness'?: number | null } | null;
+    };
+    const raw = sj.summary_stats?.['2yr_mean_citedness'];
+    const metric: JournalMetric | null =
+      typeof raw === 'number' && raw > 0 ? { value: raw, journal: (sj.display_name ?? '').trim() } : null;
+    journalMetricBySource.set(sid, metric);
+    return metric;
+  } catch {
+    return null; // network/parse error — uncached, retries on revisit.
+  }
+}
+
 /** Per-DOI cache of the combined multi-source union. */
 const cache = new Map<string, MultiSourceResult>();
 
