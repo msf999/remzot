@@ -208,6 +208,7 @@ async function crossrefRefs(doi: string): Promise<RawPaper[]> {
     const j = (await res.json()) as {
       message?: {
         reference?: {
+          key?: string;
           DOI?: string;
           'article-title'?: string;
           'volume-title'?: string;
@@ -218,7 +219,27 @@ async function crossrefRefs(doi: string): Promise<RawPaper[]> {
         }[];
       };
     };
-    return (j.message?.reference ?? []).map((r) => ({
+    const raw = j.message?.reference ?? [];
+    // Crossref returns the reference array in an arbitrary (often scrambled) order, NOT the order
+    // the references appear in the paper. The real in-document ordinal lives in each entry's `key`
+    // (e.g. "ref1".."ref37", "BIB12", "10.1109/x-ref-001" → 1). Recover document order by sorting on
+    // the LAST digit-group of the key (the ordinal usually trails any DOI/prefix). Only reorder when
+    // EVERY reference yields a unique ordinal — otherwise the keys aren't plain ordinals (e.g.
+    // author-year keys), so keep Crossref's array order. (mergeUnique stamps `order` from this
+    // insertion sequence, which drives the menu's "Default" sort.)
+    const ordinalOf = (key?: string): number | null => {
+      const groups = (key ?? '').match(/\d+/g);
+      return groups && groups.length ? Number(groups[groups.length - 1]) : null;
+    };
+    const ordinals = raw.map((r) => ordinalOf(r.key));
+    const ordered =
+      ordinals.every((n) => n !== null) && new Set(ordinals).size === ordinals.length
+        ? raw
+            .map((r, i) => ({ r, n: ordinals[i] as number }))
+            .sort((a, b) => a.n - b.n)
+            .map((x) => x.r)
+        : raw;
+    return ordered.map((r) => ({
       doi: normalizeDoi(r.DOI),
       // Real title only. `unstructured` (a raw citation string) is NOT a title — keep it as a fallback
       // so enrichMissing still fetches the real title by DOI (Crossref refs often have only unstructured).
