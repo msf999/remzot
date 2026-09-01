@@ -12,12 +12,16 @@ import {
   ZOTERO_ITEM_POWERUP,
 } from './consts';
 import {
+  createChildNote,
+  createChildNotes,
   createZoteroItems,
   displayName,
   extractMetadata,
   fetchCitoidItem,
   fetchCollections,
+  fetchAllNotes,
   fetchItemByKey,
+  fetchItemChildNotes,
   fetchItemTypeLabels,
   findZoteroItemByDoi,
   type MetaContext,
@@ -25,9 +29,22 @@ import {
   parseDateParts,
   pushItemCollections,
   pushItemTags,
+  pushNoteHtml,
+  type NoteCreateResult,
+  ZOTERO_WRITE_BATCH,
+  zoteroThrottleReport,
+  type ZoteroNote,
   type ZoteroCollection,
   type ZoteroItem,
 } from './zoteroApi';
+import {
+  type BuiltNote,
+  buildNote,
+  collectBody,
+  extractNoteHash,
+  type NoteSource,
+  remnoteDeepLink,
+} from './notes';
 import type { SyncLog } from './log';
 
 /** Cap on how many individual rows each per-item enumeration writes to the log. */
@@ -135,6 +152,30 @@ export interface MatchEntry {
   item: ZoteroItem;
 }
 
+/**
+ * An item whose Remnote notes differ from the note currently stored in Zotero.
+ *
+ * ONE-WAY (Remnote → Zotero), like tags. `noteKey` is set when we are updating the note Remzot
+ * previously wrote; absent means we will create one.
+ */
+export interface NotePushEntry {
+  /** Stable id (e.g. `n:<remId>`). */
+  id: string;
+  name: string;
+  rem: PluginRem;
+  /** The Zotero item the note hangs off. */
+  itemKey: string;
+  /** The existing Remzot-written note to PATCH, if any. */
+  noteKey?: string;
+  noteVersion?: number;
+  /** Rendered note HTML, marker included. */
+  html: string;
+  /** Hash of the cheap markdown rendering — what the marker carries. */
+  hash: string;
+  /** Number of body lines, for the preview row. */
+  lineCount: number;
+}
+
 /** The full set of changes a sync would make. */
 export interface SyncPlan {
   toCreate: CreateEntry[];
@@ -149,6 +190,8 @@ export interface SyncPlan {
   toDelete: DeleteEntry[];
   /** Items edited in Remnote since the last sync, whose tags will be pushed back to Zotero. */
   toPushTags: PushEntry[];
+  /** Items whose Remnote notes differ from the note stored in Zotero. */
+  toPushNotes: NotePushEntry[];
   /** Existing docs already synced and up to date — shown read-only. */
   alreadyPresent: KeptEntry[];
   /** True when the Zotero fetch came back empty, so deletions are suppressed for safety. */
@@ -301,6 +344,14 @@ export interface SyncContext {
   /** Epoch-ms of the last successful Apply (0 if never). Gates local-edit → Zotero push. */
   lastSyncAt: number;
   /**
+   * Zotero item key → its existing child note, from ONE library-wide `itemType=note` sweep.
+   * Absent when the context was built without notes (e.g. the on-page menu, which fetches the
+   * single item's children instead of sweeping ~1500 notes).
+   */
+  notesByParent?: Map<string, ZoteroNote>;
+  /** This knowledge base's id, for the RemNote deep link on a pushed note's first line. */
+  kbId?: string;
+  /**
    * Resolved Incremental-Everything setup for `makeIncremental`, computed ONCE per run (the parent
    * lookup + custom-slot enumeration must not repeat per created item). `undefined` = not resolved
    * yet; `null` = resolved but unavailable (setting off, or IE not installed). See `getIncSetup`.
@@ -323,7 +374,11 @@ interface IncSetup {
 }
 
 /** Build a SyncContext: fetch the item-type labels and the collection list once. */
-export async function buildSyncContext(plugin: RNPlugin, log?: SyncLog): Promise<SyncContext> {
+export async function buildSyncContext(
+  plugin: RNPlugin,
+  log?: SyncLog,
+  opts?: { withNotes?: boolean }
+): Promise<SyncContext> {
   const typeLabels = await fetchItemTypeLabels(plugin, log);
   const collections = await fetchCollections(plugin, log);
   const lastSyncAt = (await plugin.storage.getSynced<number>(STORAGE.lastSync)) ?? 0;
@@ -333,6 +388,37 @@ export async function buildSyncContext(plugin: RNPlugin, log?: SyncLog): Promise
       ? `Last successful sync: ${new Date(lastSyncAt).toISOString()} — items edited in Remnote after this push their tags to Zotero.`
       : 'No prior sync recorded — local-edit detection (Remnote → Zotero) is skipped this run.'
   );
+  // The KB id is only needed for the deep link on a pushed note's first line.
+  //
+  // Deliberately NOT plugin.kb.getCurrentKnowledgeBaseData(): that call is gated behind the
+  // `KnowledgeBaseInfo` access scope, which this plugin does not request, so it raises a
+  // user-visible "no scope has permission level of at least 'Read'" banner in RemNote even when
+  // caught. The address-bar URL is `…/w/<kbId>/<slug>-<remId>`, so the id can be parsed from
+  // window.getURL() instead — no new scope, no re-approving permissions.
+  let kbId: string | undefined;
+  try {
+    const url = await plugin.window.getURL();
+    kbId = /\/w\/([A-Za-z0-9]{8,})/.exec(url ?? '')?.[1];
+  } catch {
+    kbId = undefined;
+  }
+  if (!kbId) log?.log('notes', 'Could not resolve the knowledge-base id — note titles will not be linked.');
+
+  // One sweep for every note in the library, so note detection costs no per-item requests.
+  let notesByParent: Map<string, ZoteroNote> | undefined;
+  if (opts?.withNotes) {
+    const all = await fetchAllNotes(plugin, log);
+    notesByParent = new Map();
+    for (const n of all) {
+      if (!n.parentItem) continue;
+      // Only ever adopt a note WE wrote (it carries the marker); a hand-written Zotero note on
+      // the same item must never be overwritten by the push.
+      if (!extractNoteHash(n.note)) continue;
+      notesByParent.set(n.parentItem, n);
+    }
+    log?.log('notes', `${notesByParent.size} of ${all.length} note(s) carry a Remzot marker.`);
+  }
+
   return {
     typeLabels,
     collections,
@@ -345,6 +431,8 @@ export async function buildSyncContext(plugin: RNPlugin, log?: SyncLog): Promise
     collectionsBuilt: false,
     refNameCache: new Map(),
     lastSyncAt,
+    notesByParent,
+    kbId,
   };
 }
 
@@ -1038,7 +1126,10 @@ async function mergeDuplicateLookupRems(
       });
       await refRem.setText(newTxt as RichTextInterface);
     }
-    await dup.remove();
+    // Chunked, like every other deletion: `foldInto` only re-parents NON-structural children, so a
+    // dup can still carry a subtree big enough to raise RemNote's unanswerable confirm dialog —
+    // and this path runs during PREVIEW ("Get"), before Apply is ever clicked.
+    await removeRemDeep(dup, SAFE_DELETE_SUBTREE, log, 'merge duplicate');
   };
 
   const mergeUnder = async (parent: PluginRem, label: string, recurse: boolean): Promise<void> => {
@@ -1129,6 +1220,172 @@ async function mergeDuplicateLookupRems(
   return merged;
 }
 
+/**
+ * How many rems a single `remove()` may take out before RemNote demands confirmation.
+ *
+ * RemNote now guards bulk deletion with a "You're about to delete N bullets — type 'delete' to
+ * confirm" dialog. A plugin cannot drive that dialog (there is no confirm/force option on
+ * `remove()` and nothing in the SDK to answer it), and confirming it by hand does NOT resume the
+ * plugin's call — the request just hangs. It also does not throw, so we cannot detect it and
+ * retry. The only reliable strategy is to never present it with a subtree big enough to ask.
+ *
+ * Deliberately well below the observed trigger (112 bullets): the real threshold is undocumented,
+ * and the cost of being conservative is only a handful of extra calls on the rare large doc.
+ */
+export const SAFE_DELETE_SUBTREE = 15;
+
+/**
+ * Delete a rem and its whole subtree without ever tripping RemNote's bulk-delete confirmation.
+ *
+ * Small subtrees go in one call. Large ones are dismantled bottom-up: descend until a subtree is
+ * under the limit, remove that, and repeat — so the parent is childless (and therefore a 1-bullet
+ * delete) by the time we get to it. Costs one `getDescendants()` plus roughly size/limit removes.
+ */
+export async function removeRemDeep(
+  rem: PluginRem,
+  maxSubtree: number = SAFE_DELETE_SUBTREE,
+  log?: SyncLog,
+  label?: string
+): Promise<void> {
+  let all: PluginRem[] = [];
+  let sized = true;
+  try {
+    all = (await rem.getDescendants()) ?? [];
+  } catch {
+    all = [];
+    sized = false;
+  }
+  // If we could not size the subtree, do NOT assume it is small — an unmeasured bulk remove is
+  // exactly what raises RemNote's confirmation dialog, which cannot be answered from a plugin.
+  // Fall back to a direct-children walk, which is still bounded.
+  if (!sized) {
+    let kids: PluginRem[] = [];
+    try {
+      kids = (await rem.getChildrenRem()) ?? [];
+    } catch {
+      kids = [];
+    }
+    log?.log('apply', `  ${label ?? rem._id}: could not size subtree; removing ${kids.length} child(ren) first.`);
+    for (const k of kids) await removeRemDeep(k, maxSubtree, log, label);
+    await rem.remove();
+    return;
+  }
+  if (all.length < maxSubtree) {
+    if (all.length > 0)
+      log?.log('apply', `  ${label ?? rem._id}: ${all.length + 1} bullet(s), single remove().`);
+    await rem.remove();
+    return;
+  }
+  log?.log(
+    'apply',
+    `  ${label ?? rem._id}: ${all.length + 1} bullet(s) — dismantling bottom-up in chunks of ${maxSubtree}.`
+  );
+  // Mirrored to the console because RemNote's bulk-delete dialog UNMOUNTS the popup, taking the
+  // in-popup Log box with it — the console is the only place these survive to be read afterwards.
+  // eslint-disable-next-line no-console
+  console.warn(
+    `Remzot delete: ${label ?? rem._id} has ${all.length + 1} bullets; chunking at ${maxSubtree}.`
+  );
+
+  const byId = new Map<string, PluginRem>();
+  for (const r of all) if (r?._id) byId.set(r._id, r);
+
+  const kidsOf = (id: string): string[] =>
+    ((byId.get(id) as unknown as { children?: string[] })?.children ?? []).filter((c) => byId.has(c));
+
+  // Memoized subtree sizes; `guard` only breaks a cycle should the graph ever contain one.
+  const sizes = new Map<string, number>();
+  const sizeOf = (id: string, guard: Set<string>): number => {
+    const memo = sizes.get(id);
+    if (memo !== undefined) return memo;
+    if (guard.has(id)) return 0;
+    guard.add(id);
+    let n = 1;
+    for (const c of kidsOf(id)) n += sizeOf(c, guard);
+    sizes.set(id, n);
+    return n;
+  };
+
+  let calls = 0;
+  let biggest = 0;
+  const removeUnder = async (id: string): Promise<void> => {
+    const target = byId.get(id);
+    if (!target) return;
+    const n = sizeOf(id, new Set());
+    if (n <= maxSubtree) {
+      calls += 1;
+      biggest = Math.max(biggest, n);
+      // eslint-disable-next-line no-console
+      console.warn(`Remzot delete: remove() call #${calls} takes out ${n} bullet(s).`);
+      await target.remove();
+      return;
+    }
+    for (const c of kidsOf(id)) await removeUnder(c);
+    await target.remove(); // childless by now, so a 1-bullet delete
+  };
+
+  for (const c of ((rem as unknown as { children?: string[] }).children ?? []).filter((c) =>
+    byId.has(c)
+  )) {
+    await removeUnder(c);
+  }
+  // eslint-disable-next-line no-console
+  console.warn(
+    `Remzot delete: finishing ${label ?? rem._id} — ${calls} chunk call(s), largest ${biggest} bullet(s).`
+  );
+  log?.log('apply', `  ${label ?? rem._id}: ${calls} chunk call(s), largest ${biggest} bullet(s).`);
+  await rem.remove();
+}
+
+/**
+ * Serialize one item doc's body into a Zotero-ready note.
+ *
+ * `rich` = false is the detection pass (~2 host calls: children + descendants). `rich` = true adds
+ * heading level / todo state / sub-document detection at ~3 calls per rem, so it is only paid for
+ * items actually being pushed — with `hashOverride` carrying the cheap hash forward so the marker
+ * stays comparable run to run.
+ */
+async function buildNoteForDoc(
+  plugin: RNPlugin,
+  ctx: SyncContext,
+  doc: PluginRem,
+  name: string,
+  rich: boolean,
+  hashOverride?: string
+): Promise<BuiltNote | null> {
+  const ref = (id: string) => resolveRefName(plugin, ctx, id);
+  const lines = await collectBody(plugin, doc, ref, rich);
+  if (!lines.length) return null;
+
+  // Backlinks ("Referenced by"), kept per mo's 2026-09-01 decision. Best-effort: a failure here
+  // costs a section, never the push.
+  // Deduped and SORTED: remsReferencingThis carries no ordering guarantee, and these lines are
+  // hashed — an unstable order would re-push the note on every machine that returns a different
+  // one. Every other order-sensitive comparison in this file is normalized the same way.
+  const referencedBy: { name: string; url?: string }[] = [];
+  try {
+    const back = (await doc.remsReferencingThis()) ?? [];
+    const seenRefs = new Set<string>();
+    for (const r of back) {
+      if (!r?._id || seenRefs.has(r._id)) continue;
+      seenRefs.add(r._id);
+      const n = (await remName(plugin, r)).trim();
+      if (n) referencedBy.push({ name: n, url: ctx.kbId ? remnoteDeepLink(ctx.kbId, r._id, n) : undefined });
+    }
+    referencedBy.sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    /* backlinks unavailable — omit the section */
+  }
+
+  const src: NoteSource = {
+    title: name,
+    docUrl: ctx.kbId ? remnoteDeepLink(ctx.kbId, doc._id, name) : undefined,
+    lines,
+    referencedBy,
+  };
+  return buildNote(src, hashOverride);
+}
+
 export async function computeSyncPlan(
   plugin: RNPlugin,
   items: ZoteroItem[],
@@ -1160,6 +1417,7 @@ export async function computeSyncPlan(
   const toUpdate: UpdateEntry[] = [];
   const toMatch: MatchEntry[] = [];
   const toPushTags: PushEntry[] = [];
+  const toPushNotes: NotePushEntry[] = [];
   const alreadyPresent: KeptEntry[] = [];
   let skippedInternal = 0;
   let listed = 0;
@@ -1300,6 +1558,49 @@ export async function computeSyncPlan(
             );
         }
       }
+
+      // Notes → Zotero (one-way, like tags). Detection is a HASH comparison, deliberately NOT a
+      // timestamp: rem.updatedAt advances on cross-device save (finding F1), and Zotero normalizes
+      // note HTML server-side, so neither the local clock nor the remote body is a trustworthy
+      // signal. We compare our own hash, carried inside the note itself — which is also why this
+      // needs no new powerup slot (slots are permanent — see the Gotchas).
+      if (ctx.notesByParent) {
+        try {
+          const probe = await buildNoteForDoc(plugin, ctx, child, name, false);
+          if (probe && !probe.empty) {
+            const existing = ctx.notesByParent.get(key);
+            const storedHash = existing ? extractNoteHash(existing.note) : null;
+            if (storedHash !== probe.hash) {
+              const built = (await buildNoteForDoc(plugin, ctx, child, name, true, probe.hash)) ?? probe;
+              if (built.tooLong) {
+                log?.log(
+                  'plan',
+                  `  NOTE   "${shown}" SKIPPED — ${built.html.length} chars exceeds Zotero's 500,000-char note limit.`
+                );
+              } else {
+                toPushNotes.push({
+                  id: `n:${child._id}`,
+                  name,
+                  rem: child,
+                  itemKey: key,
+                  noteKey: existing?.key,
+                  noteVersion: existing?.version,
+                  html: built.html,
+                  hash: probe.hash,
+                  lineCount: built.lineCount,
+                });
+                if (listed < LOG_LIST_CAP)
+                  log?.log(
+                    'plan',
+                    `  NOTE   "${shown}" — ${existing ? 'update' : 'create'} note (${built.lineCount} line(s)).`
+                  );
+              }
+            }
+          }
+        } catch (err) {
+          log?.log('plan', `  NOTE   "${shown}" scan failed: ${errMsg(err)}`);
+        }
+      }
       listed += 1;
     }
 
@@ -1416,6 +1717,7 @@ export async function computeSyncPlan(
     toMatch,
     toDelete: finalDelete,
     toPushTags,
+    toPushNotes,
     alreadyPresent,
     emptyLibrarySkippedDeletes,
     partialFetchSkippedDeletes,
@@ -1621,6 +1923,8 @@ export interface ApplySelection {
   toMatch: MatchEntry[];
   /** Items whose user-owned tags will be written back to Zotero. */
   toPushTags: PushEntry[];
+  /** Items whose Remnote notes will be written to Zotero as a child note. */
+  toPushNotes: NotePushEntry[];
   toDelete: DeleteEntry[];
 }
 
@@ -1643,7 +1947,14 @@ export async function applySyncPlan(
   ctx: SyncContext,
   callbacks: ApplyCallbacks = {},
   log?: SyncLog
-): Promise<{ created: number; updated: number; matched: number; pushed: number; deleted: number }> {
+): Promise<{
+  created: number;
+  updated: number;
+  matched: number;
+  pushed: number;
+  notesPushed: number;
+  deleted: number;
+}> {
   const onItemDone = callbacks.onItemDone ?? (() => {});
 
   // PRECONDITION: the Zotero Item powerup MUST be registered before we mutate ANYTHING. If it isn't
@@ -1692,7 +2003,7 @@ export async function applySyncPlan(
   for (const entry of selection.toDelete) {
     let ok = true;
     try {
-      await entry.rem.remove();
+      await removeRemDeep(entry.rem, SAFE_DELETE_SUBTREE, log, `"${entry.name || '(untitled)'}"`);
       deleted += 1;
       if (delListed < LOG_LIST_CAP) {
         log?.log('apply', `  deleted "${entry.name || '(untitled)'}" (${entry.reason}).`);
@@ -1762,6 +2073,80 @@ export async function applySyncPlan(
     onItemDone(entry.id, ok);
   }
 
+  // Notes phase: write each item's Remnote notes to Zotero as a child note. Updates the note we
+  // wrote before (identified by its marker) or creates one; never touches a hand-written note.
+  //
+  // CREATES are batched at Zotero's 50-objects-per-request limit. This is what makes a first
+  // full-library run safe: one note per item unbatched is ~1,500 sequential POSTs, which is exactly
+  // the pattern that gets a client throttled. UPDATES stay one PATCH each ON PURPOSE — the batched
+  // update form is a full replace, so it would have to re-send `parentItem` or silently detach the
+  // note from its item. Every request also goes through zoteroFetch, which honours Backoff /
+  // Retry-After, so throughput degrades gracefully instead of failing.
+  let notesPushed = 0;
+  let notesFailed = 0;
+  const hasNote = (e: NotePushEntry) => !!e.noteKey && e.noteVersion !== undefined;
+  const noteUpdates = selection.toPushNotes.filter(hasNote);
+  const noteCreates = selection.toPushNotes.filter((e) => !hasNote(e));
+
+  for (const entry of noteUpdates) {
+    let ok = true;
+    try {
+      await pushNoteHtml(plugin, entry.noteKey!, entry.noteVersion!, entry.html, log);
+      await stampSynced(entry.rem);
+      notesPushed += 1;
+    } catch (err) {
+      ok = false;
+      notesFailed += 1;
+      log?.log('apply', `  NOTES FAILED "${entry.name}" (item ${entry.itemKey}): ${errMsg(err)}`);
+    }
+    onItemDone(entry.id, ok);
+  }
+
+  if (noteCreates.length > 0) {
+    let results: NoteCreateResult[];
+    try {
+      results = await createChildNotes(
+        plugin,
+        noteCreates.map((e) => ({ parentItem: e.itemKey, note: e.html })),
+        log
+      );
+    } catch (err) {
+      // A whole-call failure (e.g. missing credentials) fails every entry rather than throwing —
+      // the run still reports per-item ❌ instead of aborting mid-phase.
+      results = noteCreates.map(() => ({ ok: false, error: errMsg(err) }));
+      log?.log('apply', `  NOTE BATCH FAILED: ${errMsg(err)}`);
+    }
+    for (let i = 0; i < noteCreates.length; i += 1) {
+      const entry = noteCreates[i];
+      const ok = results[i]?.ok === true;
+      if (ok) {
+        try {
+          await stampSynced(entry.rem);
+        } catch {
+          /* the per-doc stamp is cosmetic — never fail a successful push over it */
+        }
+        notesPushed += 1;
+      } else {
+        notesFailed += 1;
+        log?.log(
+          'apply',
+          `  NOTES FAILED "${entry.name}" (item ${entry.itemKey}): ${results[i]?.error ?? 'unknown'}`
+        );
+      }
+      onItemDone(entry.id, ok);
+    }
+  }
+
+  if (selection.toPushNotes.length > 0) {
+    const throttle = zoteroThrottleReport();
+    log?.log(
+      'apply',
+      `notes: ${notesPushed} pushed (${noteCreates.length} created in batches of ` +
+        `${ZOTERO_WRITE_BATCH}, ${noteUpdates.length} updated), ${notesFailed} failed` +
+        `${throttle.retries ? `, ${throttle.retries} throttle retry/retries` : ''}.`
+    );
+  }
+
   // Adopt phase: stamp identity onto citekey-matched keyless docs and backfill their metadata.
   // The rem (and its children / inbound references) is preserved — that's the whole point.
   let matched = 0;
@@ -1829,7 +2214,7 @@ export async function applySyncPlan(
     'apply',
     `Finished. Created ${created} (${createFailed} failed), updated ${updated} (${updateFailed} failed), matched ${matched} (${matchFailed} failed), pushed ${pushed} (${pushFailed} failed), deleted ${deleted} (${deleteFailed} failed), status tag-backs ${statusTagged} (${statusTagFailed} failed).`
   );
-  return { created, updated, matched, pushed, deleted };
+  return { created, updated, matched, pushed, notesPushed, deleted };
 }
 
 // ───────────────────────── Single-item sync (on-page menu) ─────────────────────────
@@ -1861,7 +2246,7 @@ export interface SingleSyncResult {
  * Does NOT touch the global STORAGE.lastSync baseline (that gates the library-wide push) or the
  * doc body / abstract.
  *
- * TODO (notes): a later feature will also push this item's Remnote notes → Zotero from here.
+ * Notes are pushed from here too (2026-09-01), unconditionally — see the NOTES block below.
  */
 export async function syncSingleItem(
   plugin: RNPlugin,
@@ -1920,6 +2305,35 @@ export async function syncSingleItem(
     pushed = desiredTags;
   }
 
+  // NOTES: Remnote → Zotero, one-way. Unlike the bulk sync this pushes UNCONDITIONALLY rather
+  // than gating on the hash — it is a deliberate, single-item user action, so it doubles as the
+  // escape hatch for the bulk path's one blind spot (a formatting-only edit, e.g. ticking a todo,
+  // changes no text and so does not move the cheap hash). One item = one extra request.
+  let notesPushed = false;
+  try {
+    // Hash from the CHEAP pass so the marker stays comparable with computeSyncPlan's probe —
+    // otherwise the per-item Sync stamps a rich-pass hash the bulk detector can never match, and
+    // the item re-stages on every subsequent preview.
+    const probe = await buildNoteForDoc(plugin, ctx, rem, wantName, false);
+    const built = await buildNoteForDoc(plugin, ctx, rem, wantName, true, probe?.hash);
+    if (built && !built.empty) {
+      if (built.tooLong) {
+        log?.log('apply', `  notes skipped — ${built.html.length} chars exceeds Zotero's limit.`);
+      } else {
+        // Only ever replace a note WE wrote (marker-bearing); hand-written notes are untouched.
+        const existing = (await fetchItemChildNotes(plugin, key, log)).find((n) =>
+          extractNoteHash(n.note)
+        );
+        if (existing) await pushNoteHtml(plugin, existing.key, existing.version, built.html, log);
+        else await createChildNote(plugin, key, built.html, log);
+        notesPushed = true;
+      }
+    }
+  } catch (err) {
+    // A notes failure must not abort the sync — slots and version are still worth stamping.
+    log?.log('apply', `  notes push failed for "${wantName}": ${errMsg(err)}`);
+  }
+
   // Stamp the post-sync version (so the next library sync won't re-diff) + this doc's last-sync
   // time (per-doc slot → powers the menu's "Sync · <date>"; no central map to bloat).
   await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.version, [String(version)]);
@@ -1928,6 +2342,7 @@ export async function syncSingleItem(
   const parts: string[] = [];
   if (pulled.length) parts.push(`refreshed ${pulled.join(', ')}`);
   if (pushed) parts.push(`pushed ${pushed.length} tag${pushed.length === 1 ? '' : 's'} to Zotero`);
+  if (notesPushed) parts.push('pushed notes to Zotero');
   const message = parts.length
     ? `Synced "${wantName}" — ${parts.join(', ')}.`
     : `"${wantName}" is already up to date.`;

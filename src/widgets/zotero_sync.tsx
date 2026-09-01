@@ -193,6 +193,18 @@ export const ZoteroSync = () => {
           })),
         },
         {
+          key: 'push-notes',
+          label: 'Push notes to Zotero',
+          count: plan.toPushNotes.length,
+          rows: plan.toPushNotes.map((e) => ({
+            id: e.id,
+            name: e.name || '(untitled)',
+            detail: `${e.noteKey ? 'update' : 'create'} Zotero note — ${e.lineCount} line${
+              e.lineCount === 1 ? '' : 's'
+            }`,
+          })),
+        },
+        {
           key: 'delete',
           label: 'Will delete',
           count: plan.toDelete.length,
@@ -267,7 +279,7 @@ export const ZoteroSync = () => {
       });
       setProgress(null);
       setStatus(`Fetched ${items.length} items. Loading collections & item types from Zotero…`);
-      const ctx = await buildSyncContext(plugin, log);
+      const ctx = await buildSyncContext(plugin, log, { withNotes: true });
       ctxRef.current = ctx;
       setStatus(`Comparing ${items.length} item(s) against Remnote…`);
       const newPlan = await computeSyncPlan(plugin, items, ctx, log, { reportedTotal });
@@ -278,6 +290,7 @@ export const ZoteroSync = () => {
         ...newPlan.toUpdate.flatMap((e) => e.changes.map((c) => `${e.id}:${c.field}`)),
         ...newPlan.toMatch.map((e) => e.id),
         ...newPlan.toPushTags.map((e) => e.id),
+        ...newPlan.toPushNotes.map((e) => e.id),
       ];
       setSelected(new Set(allIds));
       setPlan(newPlan);
@@ -293,7 +306,7 @@ export const ZoteroSync = () => {
       }
 
       const parts = [
-        `Found ${items.length} items in Zotero — ${newPlan.alreadyPresent.length} already on Remnote, ${newPlan.toCreate.length} to create, ${newPlan.toUpdate.length} to update, ${newPlan.toMatch.length} to match, ${newPlan.toPushTags.length} to push to Zotero, ${newPlan.toDelete.length} to delete.`,
+        `Found ${items.length} items in Zotero — ${newPlan.alreadyPresent.length} already on Remnote, ${newPlan.toCreate.length} to create, ${newPlan.toUpdate.length} to update, ${newPlan.toMatch.length} to match, ${newPlan.toPushTags.length} to push to Zotero, ${newPlan.toPushNotes.length} note(s) to push, ${newPlan.toDelete.length} to delete.`,
       ];
       if (newPlan.emptyLibrarySkippedDeletes) {
         parts.push(
@@ -338,7 +351,14 @@ export const ZoteroSync = () => {
       .filter((u) => u.fields.size > 0);
     const toMatch = plan.toMatch.filter((e) => selected.has(e.id));
     const toPushTags = plan.toPushTags.filter((e) => selected.has(e.id));
-    const total = toCreate.length + toUpdate.length + toMatch.length + toPushTags.length + toDelete.length;
+    const toPushNotes = plan.toPushNotes.filter((e) => selected.has(e.id));
+    const total =
+      toCreate.length +
+      toUpdate.length +
+      toMatch.length +
+      toPushTags.length +
+      toPushNotes.length +
+      toDelete.length;
     if (total === 0) return;
 
     setBusy(true);
@@ -351,12 +371,12 @@ export const ZoteroSync = () => {
     setHasLog(true);
     log.log(
       'run',
-      `Apply changes clicked — ${toCreate.length} create(s), ${toUpdate.length} update(s), ${toMatch.length} adoption(s), ${toPushTags.length} push(es), ${toDelete.length} delete(s).`
+      `Apply changes clicked — ${toCreate.length} create(s), ${toUpdate.length} update(s), ${toMatch.length} adoption(s), ${toPushTags.length} push(es), ${toPushNotes.length} note push(es), ${toDelete.length} delete(s).`
     );
     try {
-      const { created, updated, matched, pushed, deleted } = await applySyncPlan(
+      const { created, updated, matched, pushed, notesPushed, deleted } = await applySyncPlan(
         plugin,
-        { toCreate, toUpdate, toMatch, toPushTags, toDelete },
+        { toCreate, toUpdate, toMatch, toPushTags, toPushNotes, toDelete },
         ctx,
         {
           onItemDone: (id, ok) => {
@@ -368,12 +388,15 @@ export const ZoteroSync = () => {
         log
       );
       setApplied(true);
-      const okCount = created + updated + matched + pushed + deleted;
+      const okCount = created + updated + matched + pushed + notesPushed + deleted;
       const failCount = total - okCount;
-      setStatus(`Done. Created ${created}, updated ${updated}, matched ${matched}, pushed ${pushed}, deleted ${deleted}.`);
+      setStatus(
+        `Done. Created ${created}, updated ${updated}, matched ${matched}, pushed ${pushed}, ` +
+          `${notesPushed} note(s) pushed, deleted ${deleted}.`
+      );
       await plugin.app.toast(
         `Zotero sync applied — ${created} created, ${updated} updated, ${matched} matched, ` +
-          `${pushed} pushed, ${deleted} deleted${failCount > 0 ? `, ${failCount} failed` : ''}.`
+          `${pushed} pushed, ${notesPushed} notes, ${deleted} deleted${failCount > 0 ? `, ${failCount} failed` : ''}.`
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -402,6 +425,7 @@ export const ZoteroSync = () => {
       plan.toDelete.filter((e) => selected.has(e.id)).length +
       plan.toMatch.filter((e) => selected.has(e.id)).length +
       plan.toPushTags.filter((e) => selected.has(e.id)).length +
+      plan.toPushNotes.filter((e) => selected.has(e.id)).length +
       plan.toUpdate.filter((e) => e.changes.some((c) => selected.has(`${e.id}:${c.field}`))).length
     : 0;
   const canApply = !busy && !applied && selectedCount > 0;
@@ -415,13 +439,10 @@ export const ZoteroSync = () => {
         <div className="min-w-0">
           <h1 className="text-2xl font-semibold">Zotero Sync</h1>
           <p className="text-sm rn-clr-content-secondary">
-            Sync your personal Zotero library with Zotero/Items, matching each item by its
-            Zotero key. Zotero's metadata is pulled in as document properties, and your Status,
-            Rating, and Tags are pushed back to Zotero as that item's tags. A document under
-            Items is deleted when its key is missing from Zotero (or it has no key) — except a
-            keyless doc whose name matches a citation key, which is adopted in place instead.
-            Review the grouped changes below, tick the ones you want, then Apply — nothing
-            changes until you do.
+            Mirrors your Zotero library into Zotero/Items, matched by Zotero key. Metadata comes
+            in as properties; Status, Rating and Tags push back as Zotero tags. Docs with no live
+            key are deleted — those named by a citation key are adopted instead. Tick what you
+            want; nothing changes until you Apply.
           </p>
         </div>
         <button
@@ -529,7 +550,12 @@ export const ZoteroSync = () => {
                           <span className="shrink-0 inline-block w-3 text-xs rn-clr-content-secondary">
                             {groupCollapsed ? '▸' : '▾'}
                           </span>
-                          <span className="flex-1 min-w-0 font-mono text-sm truncate">{row.name}</span>
+                          <span
+                            className="flex-1 min-w-0 font-mono text-sm"
+                            style={{ overflowWrap: 'anywhere' }}
+                          >
+                            {row.name}
+                          </span>
                         </button>
                         {row.childCountLabel && (
                           <span className="shrink-0 text-xs rn-clr-content-tertiary whitespace-nowrap">
@@ -569,42 +595,63 @@ export const ZoteroSync = () => {
                   );
                 }
                 if (selectable) {
-                  // Selectable item leaf (create / delete).
+                  // Selectable item leaf (create / delete / match / push).
+                  // Name and detail are STACKED — the detail sits on its own line BENEATH the
+                  // citekey — so a long detail (e.g. a push row's full tag list) can never starve
+                  // the citekey into an ellipsis. Neither line truncates; both wrap instead.
                   return (
                     <label
                       key={row.id}
-                      style={{ paddingLeft: padLeft }}
-                      className="flex items-center gap-2 py-1 pr-2 rounded min-w-0"
+                      style={{ paddingLeft: padLeft, alignItems: 'flex-start' }}
+                      className="flex gap-2 py-1 pr-2 rounded min-w-0"
                     >
-                      <TriCheckbox
-                        checked={selected.has(row.id)}
-                        disabled={busy}
-                        onChange={() => toggleOne(row.id)}
-                      />
-                      <span className="flex-1 min-w-0 font-mono text-sm truncate">{row.name}</span>
-                      {row.detail && (
-                        <span className="shrink min-w-0 text-xs rn-clr-content-tertiary truncate">
-                          ({row.detail})
+                      <span className="shrink-0" style={{ marginTop: '0.15rem' }}>
+                        <TriCheckbox
+                          checked={selected.has(row.id)}
+                          disabled={busy}
+                          onChange={() => toggleOne(row.id)}
+                        />
+                      </span>
+                      <span className="flex-1 min-w-0">
+                        <span
+                          className="font-mono text-sm"
+                          style={{ display: 'block', overflowWrap: 'anywhere' }}
+                        >
+                          {row.name}
                         </span>
-                      )}
+                        {row.detail && (
+                          <span
+                            className="text-xs rn-clr-content-tertiary"
+                            style={{ display: 'block', overflowWrap: 'anywhere' }}
+                          >
+                            ({row.detail})
+                          </span>
+                        )}
+                      </span>
                       <span className="shrink-0 w-5 text-right text-sm">
                         {done.has(row.id) ? '✅' : failed.has(row.id) ? '❌' : ''}
                       </span>
                     </label>
                   );
                 }
-                // Read-only leaf (Already on Remnote).
+                // Read-only leaf (Already on Remnote) — same stacked layout, no checkbox.
                 return (
                   <div
                     key={row.id}
                     style={{ paddingLeft: padLeft }}
-                    className="flex items-center gap-2 py-1 pr-2 rounded min-w-0"
+                    className="py-1 pr-2 rounded min-w-0"
                   >
-                    <span className="flex-1 min-w-0 font-mono text-sm truncate rn-clr-content-secondary">
+                    <span
+                      className="font-mono text-sm rn-clr-content-secondary"
+                      style={{ display: 'block', overflowWrap: 'anywhere' }}
+                    >
                       {row.name}
                     </span>
                     {row.detail && (
-                      <span className="shrink-0 text-xs rn-clr-content-tertiary whitespace-nowrap">
+                      <span
+                        className="text-xs rn-clr-content-tertiary"
+                        style={{ display: 'block', overflowWrap: 'anywhere' }}
+                      >
                         ({row.detail})
                       </span>
                     )}

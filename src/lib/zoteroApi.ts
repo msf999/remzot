@@ -70,6 +70,66 @@ export interface ZoteroCollection {
 
 const ZOTERO_API_BASE = 'https://api.zotero.org';
 const PAGE_LIMIT = 100;
+/** Zotero accepts at most 50 objects per create/update request (413 beyond that). */
+export const ZOTERO_WRITE_BATCH = 50;
+
+/**
+ * Shared flow-control state for every api.zotero.org request in this session.
+ *
+ * Zotero publishes two headers: `Backoff: <seconds>` on a SUCCESSFUL response ("keep going, but
+ * slow down") and `Retry-After: <seconds>` alongside 429/503 ("this request was rejected"). Both
+ * are library-wide, so the pause has to be shared across every call site rather than per-function.
+ */
+let zoteroPauseUntil = 0;
+let zoteroRetryCount = 0;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Retries + waits observed since the last report — surfaced in the sync log. */
+export function zoteroThrottleReport(): { retries: number; pausedMs: number } {
+  const r = { retries: zoteroRetryCount, pausedMs: Math.max(0, zoteroPauseUntil - Date.now()) };
+  zoteroRetryCount = 0;
+  return r;
+}
+
+/**
+ * `fetch` for the Zotero API that honours the documented flow control, so a large run (e.g. one
+ * note per library item) cannot hammer the service into throttling us out.
+ */
+async function zoteroFetch(url: string, init?: RequestInit): Promise<Response> {
+  const MAX_ATTEMPTS = 6;
+  for (let attempt = 0; ; attempt += 1) {
+    const wait = zoteroPauseUntil - Date.now();
+    if (wait > 0) await sleep(Math.min(wait, 60_000));
+
+    const res = await fetch(url, init);
+
+    // A `Backoff` on any response means "slow down" — respect it for subsequent requests.
+    const backoff = Number(res.headers.get('Backoff'));
+    if (Number.isFinite(backoff) && backoff > 0) {
+      zoteroPauseUntil = Math.max(zoteroPauseUntil, Date.now() + backoff * 1000);
+    }
+
+    if ((res.status === 429 || res.status === 503) && attempt < MAX_ATTEMPTS - 1) {
+      const retryAfter = Number(res.headers.get('Retry-After'));
+      const delay =
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : Math.min(2 ** attempt * 1000, 32_000); // exponential fallback when the header is absent
+      zoteroPauseUntil = Math.max(zoteroPauseUntil, Date.now() + delay);
+      zoteroRetryCount += 1;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `Remzot: Zotero returned ${res.status}; waiting ${Math.round(delay / 1000)}s then retrying ` +
+          `(attempt ${attempt + 2}/${MAX_ATTEMPTS}).`
+      );
+      await sleep(delay);
+      continue;
+    }
+    return res;
+  }
+}
+
 
 /**
  * Build an Error that's ALREADY been surfaced to the user via `plugin.app.toast`. Callers that
@@ -274,7 +334,7 @@ export async function fetchTopItems(
 
     pageNum += 1;
     log?.log('fetch', `Requesting page ${pageNum} (start=${start})…`);
-    const res = await fetch(url, { headers });
+    const res = await zoteroFetch(url, { headers });
     if (!res.ok) {
       const msg = `Zotero API request failed: HTTP ${res.status} ${res.statusText}`;
       log?.log('fetch', `ERROR on page ${pageNum}: ${msg}`);
@@ -340,7 +400,7 @@ export async function fetchItemByKey(
     itemKey
   )}`;
   log?.log('fetch', `Endpoint: GET ${url} (single item).`);
-  const res = await fetch(url, { headers });
+  const res = await zoteroFetch(url, { headers });
   if (res.status === 404) {
     log?.log('fetch', `Item ${itemKey} not found in Zotero (HTTP 404).`);
     return null;
@@ -393,7 +453,7 @@ export async function fetchCollections(plugin: RNPlugin, log?: SyncLog): Promise
       userId
     )}/collections?limit=${PAGE_LIMIT}&start=${start}`;
     pageNum += 1;
-    const res = await fetch(url, { headers });
+    const res = await zoteroFetch(url, { headers });
     if (!res.ok) {
       const msg = `Zotero collections request failed: HTTP ${res.status} ${res.statusText}`;
       log?.log('fetch', `ERROR on collections page ${pageNum}: ${msg}`);
@@ -440,7 +500,7 @@ const FALLBACK_TYPE_LABELS: Record<string, string> = {
 export async function fetchItemTypeLabels(plugin: RNPlugin, log?: SyncLog): Promise<Map<string, string>> {
   const map = new Map<string, string>(Object.entries(FALLBACK_TYPE_LABELS));
   try {
-    const res = await fetch(`${ZOTERO_API_BASE}/itemTypes?locale=en-US`);
+    const res = await zoteroFetch(`${ZOTERO_API_BASE}/itemTypes?locale=en-US`);
     if (res.ok) {
       const rows = (await res.json()) as { itemType: string; localized: string }[];
       for (const r of rows) if (r.itemType && r.localized) map.set(r.itemType, r.localized);
@@ -473,7 +533,7 @@ export async function pushItemTags(
     itemKey
   )}`;
   const body = JSON.stringify({ tags: tags.map((tag) => ({ tag })) });
-  const res = await fetch(url, {
+  const res = await zoteroFetch(url, {
     method: 'PATCH',
     headers: {
       ...headers,
@@ -501,6 +561,313 @@ export async function pushItemTags(
     )}]`
   );
   return newVersion;
+}
+
+// ───────────────────────── Child notes (Remnote → Zotero, one-way) ─────────────────────────
+
+/**
+ * A Zotero child note. `note` is HTML; `parentItem` is the owning item's key.
+ *
+ * VERIFIED against the live API (2026-09-01 probe): Zotero's sanitizer round-tripped our note
+ * HTML BYTE-IDENTICALLY — p / h1-h3 / ul / li / strong / em / code / s / a all survived, as did
+ * `zotero://` links, emoji and the trailing `remzot:<hash>` marker.
+ */
+export interface ZoteroNote {
+  key: string;
+  version: number;
+  parentItem?: string;
+  note: string;
+}
+
+/**
+ * Every note item in the personal library, in ONE paginated sweep.
+ *
+ * Deliberately not `/items/<key>/children` per item — that would be one request per library
+ * item (~1500). `?itemType=note` over `/items` returns child notes too (unlike `/items/top`,
+ * which excludes them), each carrying its own `parentItem`, `key` and `version`.
+ */
+export async function fetchAllNotes(
+  plugin: RNPlugin,
+  log?: SyncLog,
+  onProgress?: FetchProgressFn
+): Promise<ZoteroNote[]> {
+  const { userId, headers } = await readZoteroCreds(plugin, log);
+  const notes: ZoteroNote[] = [];
+  let start = 0;
+  let pageNum = 0;
+  let reportedTotal = 0;
+
+  log?.section('Fetch Zotero notes');
+  log?.log('notes', `Endpoint: GET ${ZOTERO_API_BASE}/users/${userId}/items?itemType=note`);
+
+  while (true) {
+    const url =
+      `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items` +
+      `?itemType=note&limit=${PAGE_LIMIT}&start=${start}`;
+    pageNum += 1;
+    const res = await zoteroFetch(url, { headers });
+    if (!res.ok) {
+      const msg = `Zotero note fetch failed: HTTP ${res.status} ${res.statusText}`;
+      log?.log('notes', `ERROR on page ${pageNum}: ${msg}`);
+      await plugin.app.toast(msg);
+      throw toastedError(msg);
+    }
+    const totalHeader = Number(res.headers.get('Total-Results'));
+    if (Number.isFinite(totalHeader) && totalHeader > 0) reportedTotal = totalHeader;
+
+    const page = (await res.json()) as {
+      key: string;
+      version: number;
+      data?: { key?: string; version?: number; parentItem?: string; note?: string };
+    }[];
+    for (const raw of page) {
+      const d = raw.data ?? {};
+      notes.push({
+        key: d.key ?? raw.key,
+        version: d.version ?? raw.version,
+        parentItem: d.parentItem,
+        note: d.note ?? '',
+      });
+    }
+    log?.log('notes', `Page ${pageNum}: ${page.length} note(s); ${notes.length} total so far.`);
+    onProgress?.(notes.length, reportedTotal || notes.length);
+
+    if (page.length < PAGE_LIMIT) break;
+    start += PAGE_LIMIT;
+  }
+
+  log?.log('notes', `Fetched ${notes.length} note item(s) from Zotero.`);
+  return notes;
+}
+
+/** The child notes of ONE item — used by the per-item Sync, where a full sweep would be waste. */
+export async function fetchItemChildNotes(
+  plugin: RNPlugin,
+  itemKey: string,
+  log?: SyncLog
+): Promise<ZoteroNote[]> {
+  const { userId, headers } = await readZoteroCreds(plugin, log);
+  const url =
+    `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items/` +
+    `${encodeURIComponent(itemKey)}/children?itemType=note`;
+  const res = await zoteroFetch(url, { headers });
+  if (!res.ok) {
+    // NEVER `return []` here: an empty array means "this item has no notes", so swallowing a 429
+    // or a transient 5xx would make the caller create a SECOND copy of a note that already exists.
+    // Throwing lets syncSingleItem's catch skip the note push and report it instead.
+    const msg = `Zotero child-note fetch failed for ${itemKey}: HTTP ${res.status} ${res.statusText}.`;
+    log?.log('notes', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  const page = (await res.json()) as {
+    key: string;
+    version: number;
+    data?: { key?: string; version?: number; parentItem?: string; note?: string };
+  }[];
+  return page.map((raw) => ({
+    key: raw.data?.key ?? raw.key,
+    version: raw.data?.version ?? raw.version,
+    parentItem: raw.data?.parentItem,
+    note: raw.data?.note ?? '',
+  }));
+}
+
+/**
+ * Replace a child note's body. PATCH, never PUT.
+ *
+ * TWO DOCUMENTED TRAPS, both of which silently DETACH the note into a top-level item:
+ *   1. A PUT that omits `parentItem` converts the child to top-level (Zotero has a test for it).
+ *   2. A PATCH carrying a non-empty `collections` array is read as an implicit `parentItem: false`.
+ * Sending only `{ note }` avoids both.
+ */
+export async function pushNoteHtml(
+  plugin: RNPlugin,
+  noteKey: string,
+  noteVersion: number,
+  html: string,
+  log?: SyncLog
+): Promise<number> {
+  const { userId, headers } = await readZoteroCreds(plugin, log);
+  const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items/${encodeURIComponent(
+    noteKey
+  )}`;
+  const res = await zoteroFetch(url, {
+    method: 'PATCH',
+    headers: {
+      ...headers,
+      'Content-Type': 'application/json',
+      'If-Unmodified-Since-Version': String(noteVersion),
+    },
+    body: JSON.stringify({ note: html }),
+  });
+  if (res.status === 412) {
+    const msg = `Note ${noteKey} changed on Zotero since the last fetch (HTTP 412). Re-fetch before pushing.`;
+    log?.log('apply', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  if (res.status === 413) {
+    const msg = `Note ${noteKey} is too long for Zotero (HTTP 413; the server caps notes at 500,000 characters).`;
+    log?.log('apply', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  if (!res.ok) {
+    const msg = `Zotero note write failed for ${noteKey}: HTTP ${res.status} ${res.statusText}.`;
+    log?.log('apply', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  const parsed = Number(res.headers.get('Last-Modified-Version'));
+  const newVersion = Number.isFinite(parsed) && parsed > 0 ? parsed : noteVersion;
+  log?.log('apply', `  updated note ${noteKey} (v${noteVersion}→v${newVersion}), ${html.length} chars.`);
+  return newVersion;
+}
+
+/** One note to create, as a parent-item key plus its rendered HTML. */
+export interface NoteCreateSpec {
+  parentItem: string;
+  note: string;
+}
+
+/** Per-input outcome, index-aligned with the specs passed in. */
+export interface NoteCreateResult {
+  ok: boolean;
+  key?: string;
+  version?: number;
+  error?: string;
+}
+
+/**
+ * Create MANY child notes, batched at Zotero's documented limit of 50 objects per request.
+ *
+ * This is what keeps a first full-library run sane: one note per item would be ~1,500 sequential
+ * POSTs, which is exactly the pattern that gets a client throttled. Batched, it is ~30 requests,
+ * each of them flow-controlled by `zoteroFetch`. Results stay index-aligned so the caller can
+ * still report per-item success in the UI.
+ */
+export async function createChildNotes(
+  plugin: RNPlugin,
+  specs: NoteCreateSpec[],
+  log?: SyncLog
+): Promise<NoteCreateResult[]> {
+  const out: NoteCreateResult[] = specs.map(() => ({ ok: false, error: 'not attempted' }));
+  if (!specs.length) return out;
+  const { userId, headers } = await readZoteroCreds(plugin, log);
+  const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items`;
+
+  for (let start = 0; start < specs.length; start += ZOTERO_WRITE_BATCH) {
+    const chunk = specs.slice(start, start + ZOTERO_WRITE_BATCH);
+    const payload = chunk.map((c) => ({
+      itemType: 'note',
+      parentItem: c.parentItem,
+      note: c.note,
+      tags: [],
+      // NO `collections` — child items cannot be in collections, and sending it detaches them.
+    }));
+    let res: Response;
+    try {
+      res = await zoteroFetch(url, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json',
+          'Zotero-Write-Token': makeWriteToken(),
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      for (let j = 0; j < chunk.length; j += 1) out[start + j] = { ok: false, error: msg };
+      log?.log('apply', `  note batch ${start}-${start + chunk.length - 1} failed: ${msg}`);
+      continue;
+    }
+    if (!res.ok) {
+      const msg = `HTTP ${res.status} ${res.statusText}`;
+      for (let j = 0; j < chunk.length; j += 1) out[start + j] = { ok: false, error: msg };
+      log?.log('apply', `  note batch ${start}-${start + chunk.length - 1} failed: ${msg}`);
+      continue;
+    }
+    const body = (await res.json()) as {
+      successful?: Record<string, { key?: string; version?: number; data?: { key?: string; version?: number } }>;
+      unchanged?: Record<string, unknown>;
+      failed?: Record<string, { code?: number; message?: string }>;
+    };
+    for (let j = 0; j < chunk.length; j += 1) {
+      const idx = String(j);
+      const good = body.successful?.[idx];
+      if (good) {
+        out[start + j] = {
+          ok: true,
+          key: good.data?.key ?? good.key,
+          version: good.data?.version ?? good.version,
+        };
+      } else if (body.unchanged && idx in body.unchanged) {
+        out[start + j] = { ok: true };
+      } else {
+        const f = body.failed?.[idx];
+        out[start + j] = {
+          ok: false,
+          error: f ? `${f.code ?? ''} ${f.message ?? ''}`.trim() : 'no result returned',
+        };
+      }
+    }
+    log?.log(
+      'apply',
+      `  note batch ${start}-${start + chunk.length - 1}: ${
+        chunk.filter((_, j) => out[start + j].ok).length
+      }/${chunk.length} created.`
+    );
+  }
+  return out;
+}
+
+/**
+ * Create a child note on an existing item. POSTs to /items with `parentItem` — the v3 path.
+ * (POSTing to /items/<key>/children is the obsolete v1 form and is rejected with 405 in v3.)
+ */
+export async function createChildNote(
+  plugin: RNPlugin,
+  parentItemKey: string,
+  html: string,
+  log?: SyncLog
+): Promise<{ key: string; version: number }> {
+  const { userId, headers } = await readZoteroCreds(plugin, log);
+  const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items`;
+  const res = await zoteroFetch(url, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      'Content-Type': 'application/json',
+      'Zotero-Write-Token': makeWriteToken(),
+    },
+    // A child note has NO `collections` property — child items cannot live in collections.
+    body: JSON.stringify([{ itemType: 'note', parentItem: parentItemKey, note: html, tags: [] }]),
+  });
+  if (!res.ok) {
+    const msg = `Zotero note create failed for item ${parentItemKey}: HTTP ${res.status} ${res.statusText}.`;
+    log?.log('apply', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  const body = (await res.json()) as {
+    successful?: Record<string, { key?: string; version?: number; data?: { key?: string; version?: number } }>;
+    success?: Record<string, string>;
+    failed?: Record<string, { code?: number; message?: string }>;
+  };
+  const fail = body.failed?.['0'];
+  if (fail) {
+    const msg = `Zotero rejected the note for ${parentItemKey}: ${fail.code ?? '?'} ${fail.message ?? ''}`.trim();
+    log?.log('apply', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  // The docs show both `successful` (full object) and `success` (bare key); prefer the former.
+  const ok = body.successful?.['0'];
+  const key = ok?.data?.key ?? ok?.key ?? body.success?.['0'];
+  const version = ok?.data?.version ?? ok?.version ?? 0;
+  if (!key) {
+    const msg = `Zotero note create for ${parentItemKey} returned no key.`;
+    log?.log('apply', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  log?.log('apply', `  created note ${key} on item ${parentItemKey}, ${html.length} chars.`);
+  return { key, version };
 }
 
 // ───────────────────────── Add-to-Zotero (Citoid → create items) ─────────────────────────
@@ -578,7 +945,7 @@ export async function createZoteroItems(
   const { userId, headers } = await readZoteroCreds(plugin, log);
   const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items`;
   const writeToken = makeWriteToken();
-  const res = await fetch(url, {
+  const res = await zoteroFetch(url, {
     method: 'POST',
     headers: { ...headers, 'Content-Type': 'application/json', 'Zotero-Write-Token': writeToken },
     body: JSON.stringify(datas),
@@ -622,7 +989,7 @@ export async function findZoteroItemByDoi(
     const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items?q=${encodeURIComponent(
       clean
     )}&qmode=everything&limit=50`;
-    const res = await fetch(url, { headers });
+    const res = await zoteroFetch(url, { headers });
     if (!res.ok) return null;
     const items = (await res.json()) as ZoteroItem[];
     for (const it of items) {
@@ -659,7 +1026,7 @@ export async function pushItemCollections(
 ): Promise<number> {
   const { userId, headers } = await readZoteroCreds(plugin, log);
   const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items/${encodeURIComponent(itemKey)}`;
-  const res = await fetch(url, {
+  const res = await zoteroFetch(url, {
     method: 'PATCH',
     headers: { ...headers, 'Content-Type': 'application/json', 'If-Unmodified-Since-Version': String(itemVersion) },
     body: JSON.stringify({ collections }),

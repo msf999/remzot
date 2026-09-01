@@ -933,6 +933,99 @@ const sourceIdByDoi = new Map<string, string>();
 /** OpenAlex source id → its journal metric (null = no usable stat); journal metrics are ~yearly-stable. */
 const journalMetricBySource = new Map<string, JournalMetric | null>();
 
+/** OpenAlex accepts up to 50 ids per `filter` batch. */
+const JOURNAL_BATCH = 50;
+
+/**
+ * Journal metrics for MANY DOIs in a handful of requests, for sorting a list by journal impact.
+ *
+ * The 2026-06-22 decision scoped this metric to the focus paper because per-row meant N extra
+ * `/sources` lookups. Sorting needs every row, so this batches instead: doi→source-id over `/works`
+ * (50 per request), then source-id→stat over `/sources` — and because many rows share a venue, the
+ * second batch is usually far smaller than the first. Shares `fetchJournalMetric`'s module caches,
+ * so revisits and the focus-paper lookup cost nothing. Never throws; transient failures are left
+ * UNcached so a revisit retries, while "OpenAlex doesn't know this" IS cached to stop re-asking.
+ */
+export async function fetchJournalMetrics(dois: string[]): Promise<Map<string, JournalMetric>> {
+  const out = new Map<string, JournalMetric>();
+  const want = [...new Set(dois.map((d) => normalizeDoi(d)).filter(Boolean))];
+  if (!want.length) return out;
+
+  // 1) doi → source id, only for DOIs never resolved before.
+  const missing = want.filter((d) => sourceIdByDoi.get(d) === undefined);
+  for (let i = 0; i < missing.length; i += JOURNAL_BATCH) {
+    const batch = missing.slice(i, i + JOURNAL_BATCH);
+    try {
+      const r = await fetch(
+        `https://api.openalex.org/works?filter=doi:${batch.map(encodeDoiPath).join('|')}` +
+          `&select=doi,primary_location&per-page=${JOURNAL_BATCH}`,
+        { headers: { Accept: 'application/json' } }
+      );
+      if (!r.ok) continue; // transient — leave uncached so a revisit retries
+      const jr = (await r.json()) as {
+        results?: {
+          doi?: string | null;
+          primary_location?: { source?: { id?: string | null } | null } | null;
+        }[];
+      };
+      const seen = new Set<string>();
+      for (const w of jr.results ?? []) {
+        const d = normalizeDoi(w.doi ?? '');
+        if (!d) continue;
+        seen.add(d);
+        sourceIdByDoi.set(d, oaId(w.primary_location?.source?.id));
+      }
+      // A DOI OpenAlex simply has no record of: cache '' so we stop asking every visit.
+      for (const d of batch) if (!seen.has(d)) sourceIdByDoi.set(d, '');
+    } catch {
+      /* transient — leave uncached */
+    }
+  }
+
+  // 2) source id → metric, over the UNIQUE sources still missing a cached stat.
+  const sids = [...new Set(want.map((d) => sourceIdByDoi.get(d)).filter((s): s is string => !!s))];
+  const need = sids.filter((s) => !journalMetricBySource.has(s));
+  for (let i = 0; i < need.length; i += JOURNAL_BATCH) {
+    const batch = need.slice(i, i + JOURNAL_BATCH);
+    try {
+      const r = await fetch(
+        `https://api.openalex.org/sources?filter=ids.openalex:${batch.join('|')}` +
+          `&select=id,display_name,summary_stats&per-page=${JOURNAL_BATCH}`,
+        { headers: { Accept: 'application/json' } }
+      );
+      if (!r.ok) continue;
+      const jr = (await r.json()) as {
+        results?: {
+          id?: string | null;
+          display_name?: string | null;
+          summary_stats?: { '2yr_mean_citedness'?: number | null } | null;
+        }[];
+      };
+      const seen = new Set<string>();
+      for (const s of jr.results ?? []) {
+        const sid = oaId(s.id);
+        if (!sid) continue;
+        seen.add(sid);
+        const raw = s.summary_stats?.['2yr_mean_citedness'];
+        journalMetricBySource.set(
+          sid,
+          typeof raw === 'number' && raw > 0 ? { value: raw, journal: (s.display_name ?? '').trim() } : null
+        );
+      }
+      for (const sid of batch) if (!seen.has(sid)) journalMetricBySource.set(sid, null);
+    } catch {
+      /* transient */
+    }
+  }
+
+  for (const d of want) {
+    const sid = sourceIdByDoi.get(d);
+    const m = sid ? journalMetricBySource.get(sid) : null;
+    if (m) out.set(d, m);
+  }
+  return out;
+}
+
 /** The journal-level 2-year mean citedness for a paper's venue, via OpenAlex: the work's
  *  primary_location.source id → that source's summary_stats. Two module-cached calls (doi→source id,
  *  source→stat; source metrics are stable). Returns null when there's no DOI, no primary source, or no

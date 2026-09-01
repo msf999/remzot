@@ -35,6 +35,7 @@ import {
   encodeDoiPath,
   fetchAllSources,
   fetchJournalMetric,
+  fetchJournalMetrics,
   fetchPaperMetrics,
   fetchSciteTallies,
   type JournalMetric,
@@ -360,6 +361,7 @@ function RelatedRow({
   paper,
   scite,
   metrics,
+  journal,
   inLib,
   remId,
   selected,
@@ -378,6 +380,7 @@ function RelatedRow({
   paper: RelatedPaper;
   scite?: SciteTally;
   metrics?: PaperMetrics;
+  journal?: JournalMetric;
   inLib: boolean;
   remId: string;
   selected: boolean;
@@ -406,6 +409,7 @@ function RelatedRow({
     !!metrics?.topPercent ||
     !!metrics?.retracted ||
     !!(metrics && (metrics.influential > 0 || metrics.relatedInLibrary > 0)) ||
+    !!journal ||
     !!scite;
   const hasLinks = !!paper.doi || paper.sources.length > 0 || links.some((l) => l.href);
   // In-library rows get a positive tint + left rule; others zebra-stripe lightly. No per-row box —
@@ -535,6 +539,15 @@ function RelatedRow({
                   ★ top {metrics.topPercent}%
                 </span>
               )}
+              {journal && (
+                <span
+                  title={`Journal 2-year mean citedness${
+                    journal.journal ? ` — ${journal.journal}` : ''
+                  } (OpenAlex; an impact-factor-like metric, NOT the Clarivate JIF)`}
+                >
+                  📊 {journal.value.toFixed(1)} journal
+                </span>
+              )}
               {metrics?.retracted && (
                 <span
                   className="inline-flex items-center gap-1 font-semibold"
@@ -623,7 +636,7 @@ function RelatedRow({
 const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_OPTIONS = [20, 50, 100]; // items per page (default 20, max 100)
 
-type SortKey = 'default' | 'year' | 'citations';
+type SortKey = 'default' | 'year' | 'citations' | 'journal';
 type SortDir = 'asc' | 'desc';
 type SearchScope = 'title' | 'all';
 
@@ -767,6 +780,7 @@ function ListToolbar({
         <option value="citations-asc">Sort: Fewest cited</option>
         <option value="year-desc">Sort: Newest</option>
         <option value="year-asc">Sort: Oldest</option>
+        <option value="journal-desc">Sort: Highest journal impact</option>
       </ToolSelect>
       <ToolSelect value={pageSize} title="Items per page" onChange={(v) => onSetPageSize(Number(v))}>
         {PAGE_SIZE_OPTIONS.map((n) => (
@@ -896,6 +910,8 @@ function ItemMenu() {
   // Journal-level 2-yr mean citedness (OpenAlex) for the FOCUS paper's venue — fetched in the same
   // off-critical-path effect; null while loading / no DOI / no source / no stat.
   const [journalMetric, setJournalMetric] = useState<JournalMetric | null>(null);
+  /** Per-row journal metrics, keyed by normalized DOI — drives the 'Highest journal impact' sort. */
+  const [journalMap, setJournalMap] = useState<Map<string, JournalMetric>>(new Map());
   // List toolbar + Add state (lifted here so the toolbar above the list can drive the same list).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState('');
@@ -1031,6 +1047,7 @@ function ItemMenu() {
       setSciteMap(new Map());
       setMetricsMap(new Map());
       setJournalMetric(null);
+      setJournalMap(new Map());
       return;
     }
     let cancelled = false;
@@ -1049,6 +1066,11 @@ function ItemMenu() {
     if (res) {
       void fetchPaperMetrics(dois, plugin).then((m) => {
         if (!cancelled) setMetricsMap(m);
+      });
+      // Per-row journal metrics (batched) — needed for the "Highest journal impact" sort, and shown
+      // on each row so the ordering is visible rather than sorting by an invisible number.
+      void fetchJournalMetrics(dois).then((m) => {
+        if (!cancelled) setJournalMap(m);
       });
     }
     return () => {
@@ -1137,7 +1159,15 @@ function ItemMenu() {
     const mul = sortDir === 'desc' ? -1 : 1;
     arr.sort((a, b) => {
       const val = (p: RelatedPaper): number =>
-        sortKey === 'year' ? Number(p.year) || 0 : sortKey === 'citations' ? p.citationCount : p.order;
+        sortKey === 'year'
+          ? Number(p.year) || 0
+          : sortKey === 'citations'
+          ? p.citationCount
+          : sortKey === 'journal'
+          ? // -1 (not 0) for unknown so rows with no journal metric — no DOI, preprints, books —
+            // sort BELOW a genuine 0-ish journal rather than mixing in with it.
+            journalMap.get(normalizeDoi(p.doi ?? ''))?.value ?? -1
+          : p.order;
       const av = val(a);
       const bv = val(b);
       if (av !== bv) return (av - bv) * mul;
@@ -1151,7 +1181,7 @@ function ItemMenu() {
       return a.title.localeCompare(b.title);
     });
     return arr;
-  }, [filtered, sortKey, sortDir]);
+  }, [filtered, sortKey, sortDir, journalMap]);
 
   const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
   const safePage = Math.min(page, pageCount);
@@ -1582,6 +1612,7 @@ function ItemMenu() {
                       paper={p}
                       scite={p.doi ? sciteMap.get(normalizeDoi(p.doi)) : undefined}
                       metrics={p.doi ? metricsMap.get(normalizeDoi(p.doi)) : undefined}
+                      journal={p.doi ? journalMap.get(normalizeDoi(p.doi)) : undefined}
                       inLib={inLib}
                       remId={effRemId(p)}
                       selected={selected.has(k)}
