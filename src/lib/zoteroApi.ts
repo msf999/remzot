@@ -83,7 +83,34 @@ export const ZOTERO_WRITE_BATCH = 50;
 let zoteroPauseUntil = 0;
 let zoteroRetryCount = 0;
 
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** True for an abort (the popup closed mid-fetch) — from `fetch` itself or from `sleep`. */
+export function isAbortError(e: unknown): boolean {
+  return !!e && typeof e === 'object' && (e as { name?: string }).name === 'AbortError';
+}
+
+const abortError = (): Error => {
+  const e = new Error('Fetch cancelled');
+  e.name = 'AbortError';
+  return e;
+};
+
+/**
+ * Sleep `ms`, rejecting at once with an AbortError if `signal` aborts first — so a throttle wait of
+ * up to a minute cannot outlive the popup that asked for it.
+ */
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError());
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 
 /** Retries + waits observed since the last report — surfaced in the sync log. */
 export function zoteroThrottleReport(): { retries: number; pausedMs: number } {
@@ -100,7 +127,7 @@ async function zoteroFetch(url: string, init?: RequestInit): Promise<Response> {
   const MAX_ATTEMPTS = 6;
   for (let attempt = 0; ; attempt += 1) {
     const wait = zoteroPauseUntil - Date.now();
-    if (wait > 0) await sleep(Math.min(wait, 60_000));
+    if (wait > 0) await sleep(Math.min(wait, 60_000), init?.signal ?? undefined);
 
     const res = await fetch(url, init);
 
@@ -123,7 +150,7 @@ async function zoteroFetch(url: string, init?: RequestInit): Promise<Response> {
         `Remzot: Zotero returned ${res.status}; waiting ${Math.round(delay / 1000)}s then retrying ` +
           `(attempt ${attempt + 2}/${MAX_ATTEMPTS}).`
       );
-      await sleep(delay);
+      await sleep(delay, init?.signal ?? undefined);
       continue;
     }
     return res;
@@ -299,7 +326,8 @@ export type FetchProgressFn = (fetched: number, total: number) => void;
 export async function fetchTopItems(
   plugin: RNPlugin,
   log?: SyncLog,
-  onProgress?: FetchProgressFn
+  onProgress?: FetchProgressFn,
+  signal?: AbortSignal
 ): Promise<ZoteroItem[]> {
   const userId = (await plugin.settings.getSetting<string>(SETTINGS.userId))?.trim();
   const apiKey = (await plugin.settings.getSetting<string>(SETTINGS.apiKey))?.trim();
@@ -317,7 +345,11 @@ export async function fetchTopItems(
   }
 
   const headers = { 'Zotero-API-Key': apiKey, 'Zotero-API-Version': '3' };
-  const items: ZoteroItem[] = [];
+  // Keyed, not a plain list: offset paging (`start=`) can hand back the same item on two pages if the
+  // library changes mid-fetch, and two create rows sharing the id `c:<key>` would let ONE tick create
+  // TWO documents (the duplicate-key guard only cleans that up on the NEXT run). Last page wins.
+  const byKey = new Map<string, ZoteroItem>();
+  let repeated = 0;
   let start = 0;
   let pageNum = 0;
   let dropped = 0;
@@ -334,7 +366,7 @@ export async function fetchTopItems(
 
     pageNum += 1;
     log?.log('fetch', `Requesting page ${pageNum} (start=${start})…`);
-    const res = await zoteroFetch(url, { headers });
+    const res = await zoteroFetch(url, { headers, signal });
     if (!res.ok) {
       const msg = `Zotero API request failed: HTTP ${res.status} ${res.statusText}`;
       log?.log('fetch', `ERROR on page ${pageNum}: ${msg}`);
@@ -352,7 +384,8 @@ export async function fetchTopItems(
         dropped += 1;
         continue;
       }
-      items.push(item);
+      if (byKey.has(item.key)) repeated += 1;
+      byKey.set(item.key, item);
       keptInPage += 1;
     }
     log?.log(
@@ -360,12 +393,15 @@ export async function fetchTopItems(
       `Page ${pageNum}: HTTP ${res.status}, ${page.length} returned, ${keptInPage} kept` +
         (totalResults ? ` (library reports Total-Results=${totalResults}).` : '.')
     );
-    onProgress?.(items.length, Number(totalResults) || 0);
+    onProgress?.(byKey.size, Number(totalResults) || 0);
 
     if (page.length < PAGE_LIMIT) break;
     start += PAGE_LIMIT;
   }
 
+  const items = [...byKey.values()];
+  if (repeated)
+    log?.log('fetch', `${repeated} item(s) came back on more than one page (library changed mid-fetch); deduped by key.`);
   const byType = new Map<string, number>();
   for (const it of items) {
     const t = it.data?.itemType ?? '(unknown)';
@@ -439,7 +475,11 @@ export async function readZoteroCreds(
 }
 
 /** Fetch every collection in the personal library, normalized for tree-building. */
-export async function fetchCollections(plugin: RNPlugin, log?: SyncLog): Promise<ZoteroCollection[]> {
+export async function fetchCollections(
+  plugin: RNPlugin,
+  log?: SyncLog,
+  signal?: AbortSignal
+): Promise<ZoteroCollection[]> {
   const { userId, headers } = await readZoteroCreds(plugin, log);
   const out: ZoteroCollection[] = [];
   let start = 0;
@@ -453,7 +493,7 @@ export async function fetchCollections(plugin: RNPlugin, log?: SyncLog): Promise
       userId
     )}/collections?limit=${PAGE_LIMIT}&start=${start}`;
     pageNum += 1;
-    const res = await zoteroFetch(url, { headers });
+    const res = await zoteroFetch(url, { headers, signal });
     if (!res.ok) {
       const msg = `Zotero collections request failed: HTTP ${res.status} ${res.statusText}`;
       log?.log('fetch', `ERROR on collections page ${pageNum}: ${msg}`);
@@ -497,10 +537,14 @@ const FALLBACK_TYPE_LABELS: Record<string, string> = {
  * Build an itemType → human label map. Seeds the built-in fallback, then overlays the official
  * localized labels from Zotero's public `/itemTypes` endpoint (no auth needed). Never throws.
  */
-export async function fetchItemTypeLabels(plugin: RNPlugin, log?: SyncLog): Promise<Map<string, string>> {
+export async function fetchItemTypeLabels(
+  plugin: RNPlugin,
+  log?: SyncLog,
+  signal?: AbortSignal
+): Promise<Map<string, string>> {
   const map = new Map<string, string>(Object.entries(FALLBACK_TYPE_LABELS));
   try {
-    const res = await zoteroFetch(`${ZOTERO_API_BASE}/itemTypes?locale=en-US`);
+    const res = await zoteroFetch(`${ZOTERO_API_BASE}/itemTypes?locale=en-US`, { signal });
     if (res.ok) {
       const rows = (await res.json()) as { itemType: string; localized: string }[];
       for (const r of rows) if (r.itemType && r.localized) map.set(r.itemType, r.localized);
@@ -589,7 +633,8 @@ export interface ZoteroNote {
 export async function fetchAllNotes(
   plugin: RNPlugin,
   log?: SyncLog,
-  onProgress?: FetchProgressFn
+  onProgress?: FetchProgressFn,
+  signal?: AbortSignal
 ): Promise<ZoteroNote[]> {
   const { userId, headers } = await readZoteroCreds(plugin, log);
   const notes: ZoteroNote[] = [];
@@ -605,7 +650,7 @@ export async function fetchAllNotes(
       `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items` +
       `?itemType=note&limit=${PAGE_LIMIT}&start=${start}`;
     pageNum += 1;
-    const res = await zoteroFetch(url, { headers });
+    const res = await zoteroFetch(url, { headers, signal });
     if (!res.ok) {
       const msg = `Zotero note fetch failed: HTTP ${res.status} ${res.statusText}`;
       log?.log('notes', `ERROR on page ${pageNum}: ${msg}`);

@@ -178,6 +178,8 @@ export interface NotePushEntry {
 
 /** The full set of changes a sync would make. */
 export interface SyncPlan {
+  /** Same-name duplicate lookup rems to fold into the oldest copy (opt-out rows, ids `ld:<remId>`). */
+  toFoldDuplicates: LookupDuplicate[];
   toCreate: CreateEntry[];
   /** `toCreate` arranged as a nested collection tree for the preview. */
   createGroups: CreateGroup[];
@@ -204,6 +206,15 @@ export interface SyncPlan {
   partialFetchSkippedDeletes: boolean;
 }
 
+/**
+ * Append `child` as the LAST child of `parent`. `rem.setParent(parent)` with no index PREPENDS (SDK:
+ * "added to the front"), which silently reversed the order of anything created or moved in a loop.
+ * Costs one children read; only paid when a rem is created or moved, never on a plain diff.
+ */
+async function appendUnder(child: PluginRem, parent: PluginRem): Promise<void> {
+  await child.setParent(parent, (await parent.getChildrenRem()).length);
+}
+
 /** Read a document's plain-text name. */
 async function remName(plugin: RNPlugin, rem: PluginRem): Promise<string> {
   return rem.text ? (await plugin.richText.toString(rem.text)).trim() : '';
@@ -221,13 +232,32 @@ function nameKey(s: string): string {
   return s.normalize('NFC').replace(/\s+/g, ' ').trim();
 }
 
-/** Read the Zotero key stored on a document (empty string if absent). */
-async function storedKey(rem: PluginRem): Promise<string> {
+/**
+ * Read an IDENTITY slot strictly. An UNSET slot legitimately comes back undefined and must read as ''
+ * without retrying — but a genuine read failure is retried once and then THROWN, so the preview fails
+ * loudly. Until 2026-09-05 this swallowed every error and returned '', which classed a real item doc
+ * as keyless on one flaky `getPowerupProperty` call: unless its name equalled a citekey it was staged
+ * under "Will delete (no-key)", ticked by default. The apply-time powerup precondition only catches
+ * the whole-library "powerup not registered" case, not a single bad read.
+ * (`.trim()` straight on the result is the other trap: it throws on an unset slot.)
+ */
+export async function readSlotStrict(rem: PluginRem, slot: string): Promise<string> {
+  const read = async () => ((await rem.getPowerupProperty(ZOTERO_ITEM_POWERUP, slot)) ?? '').trim();
   try {
-    return (await rem.getPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.key)).trim();
-  } catch {
-    return '';
+    return await read();
+  } catch (first) {
+    await new Promise<void>((r) => setTimeout(r, 250));
+    try {
+      return await read();
+    } catch {
+      throw new Error(`Could not read the ${slot} slot of rem ${rem._id}: ${errMsg(first)}`);
+    }
   }
+}
+
+/** The Zotero key stored on a document ('' if absent). Throws on a persistent read failure. */
+async function storedKey(rem: PluginRem): Promise<string> {
+  return readSlotStrict(rem, SLOTS.key);
 }
 
 /**
@@ -305,7 +335,7 @@ export async function ensureItemsParent(plugin: RNPlugin): Promise<PluginRem> {
     items = await plugin.rem.createRem();
     if (!items) throw new Error('Failed to create the Items document.');
     await items.setText([HIERARCHY.items]);
-    await items.setParent(root);
+    await appendUnder(items, root);
     await items.setIsDocument(true);
   }
 
@@ -377,10 +407,10 @@ interface IncSetup {
 export async function buildSyncContext(
   plugin: RNPlugin,
   log?: SyncLog,
-  opts?: { withNotes?: boolean }
+  opts?: { withNotes?: boolean; signal?: AbortSignal }
 ): Promise<SyncContext> {
-  const typeLabels = await fetchItemTypeLabels(plugin, log);
-  const collections = await fetchCollections(plugin, log);
+  const typeLabels = await fetchItemTypeLabels(plugin, log, opts?.signal);
+  const collections = await fetchCollections(plugin, log, opts?.signal);
   const lastSyncAt = (await plugin.storage.getSynced<number>(STORAGE.lastSync)) ?? 0;
   log?.log(
     'fetch',
@@ -407,7 +437,7 @@ export async function buildSyncContext(
   // One sweep for every note in the library, so note detection costs no per-item requests.
   let notesByParent: Map<string, ZoteroNote> | undefined;
   if (opts?.withNotes) {
-    const all = await fetchAllNotes(plugin, log);
+    const all = await fetchAllNotes(plugin, log, undefined, opts?.signal);
     notesByParent = new Map();
     for (const n of all) {
       if (!n.parentItem) continue;
@@ -487,7 +517,7 @@ async function ensureLookupDoc(plugin: RNPlugin, ctx: SyncContext, docName: stri
     doc = await plugin.rem.createRem();
     if (!doc) throw new Error(`Failed to create the "${docName}" document.`);
     await doc.setText([docName]);
-    await doc.setParent(root);
+    await appendUnder(doc, root);
     await doc.setIsDocument(true);
     registerChildName(ctx, root, docName, doc);
   }
@@ -512,7 +542,7 @@ async function ensureRefRem(
     rem = await plugin.rem.createRem();
     if (!rem) throw new Error(`Failed to create reference rem "${value}" under "${docName}".`);
     await rem.setText([value]);
-    await rem.setParent(doc); // plain rem — no setIsDocument
+    await appendUnder(rem, doc); // plain rem — no setIsDocument
     registerChildName(ctx, doc, value, rem);
   }
   ctx.lookupCache.set(cacheKey, rem);
@@ -549,7 +579,7 @@ async function ensureChildRem(
     rem = await plugin.rem.createRem();
     if (!rem) throw new Error(`Failed to create rem "${value}".`);
     await rem.setText([value]);
-    await rem.setParent(parent); // plain rem — no setIsDocument
+    await appendUnder(rem, parent); // plain rem — no setIsDocument
     registerChildName(ctx, parent, value, rem);
   }
   ctx.lookupCache.set(cacheKey, rem);
@@ -729,7 +759,7 @@ async function ensureCollectionsTree(plugin: RNPlugin, ctx: SyncContext, log?: S
       rem = await plugin.rem.createRem();
       if (!rem) throw new Error(`Failed to create collection rem "${coll.name}".`);
       await rem.setText([coll.name]);
-      await rem.setParent(parentRem);
+      await appendUnder(rem, parentRem);
       registerChildName(ctx, parentRem, coll.name, rem);
     }
     ctx.collectionRemByKey.set(key, rem);
@@ -1081,94 +1111,96 @@ async function computePushTags(plugin: RNPlugin, ctx: SyncContext, rem: PluginRe
  * Safety: if the Zotero fetch returns zero items (likely an error rather than a truly
  * empty library), deletions are suppressed so a transient failure can't wipe the tree.
  */
+/** One same-name duplicate lookup rem that a fold would merge into the oldest copy. */
+export interface LookupDuplicate {
+  /** Stable id, `ld:<duplicate remId>`. */
+  id: string;
+  /** Where it sits: a top-level doc name, or `Authors`, `Collections/General`, … */
+  docName: string;
+  name: string;
+  canonical: PluginRem;
+  duplicate: PluginRem;
+  /** Non-structural children of the duplicate that a fold moves under the canonical rem. */
+  childCount: number;
+  /** Rems whose references a fold re-points from the duplicate to the canonical rem. */
+  referenceCount: number;
+}
+
+/** The duplicate's children that a fold moves; powerup machinery stays and dies with the dup. */
+async function movableChildren(rem: PluginRem): Promise<PluginRem[]> {
+  const out: PluginRem[] = [];
+  for (const child of await rem.getChildrenRem()) {
+    if (await isStructuralRem(child)) continue;
+    out.push(child);
+  }
+  return out;
+}
+
 /**
- * Merge same-name duplicate rems under the Zotero hierarchy (housekeeping, runs every preview).
- * Cross-device sync races create duplicates: machine B syncs before machine A's lookup rems
- * arrive, `findByName` misses, B creates its own copy, and RemNote's sync then keeps BOTH —
- * duplicated parents (two "Archive"s) subsequently breed duplicated children. This pass:
- *   1. dedupes the top-level docs themselves (Items + the six lookup docs) under the root,
- *   2. dedupes each lookup doc's children (and recursively for the nested Collections tree),
- * keeping the OLDEST of each name (same rule `oldestChildByName` uses, so all clients converge)
- * and folding the rest in via the manual `foldInto` below — move children, rewrite inbound
- * references, remove the dup. (RemNote's NATIVE `rem.merge` was tried first and REJECTED: it
- * left the duplicates' inbound references dangling — item docs' Collection(s) rendered
- * "Loading"; do not reintroduce it.) Items docs are NOT touched beyond the top-level doc dedup
- * (item identity is the Zotero key; the duplicate-key guard handles those). No-op (one children
- * scan) when everything is already unique.
+ * Find same-name duplicate lookup rems. READ-ONLY — it reports what a fold WOULD do; nothing is
+ * moved, rewritten or removed here. (Until 2026-09-05 this pass MUTATED the KB during the preview —
+ * reparenting, rewriting references and deleting rems on "Get from Zotero", with no row and no tick.
+ * The contract now: `computeSyncPlan` writes NOTHING to the KB; `applySyncPlan` writes only ticked
+ * rows, and `foldLookupDuplicate` below is the apply-time half.)
+ *
+ * Why duplicates exist: cross-device sync races — machine B syncs before machine A's lookup rems
+ * arrive, `findByName` misses, B creates its own copy, and RemNote's sync then keeps BOTH; duplicated
+ * parents (two "Archive"s) subsequently breed duplicated children. The OLDEST of each name is the one
+ * kept (the same rule `oldestChildByName` uses, so all clients converge). Covers:
+ *   1. the top-level docs themselves (Items + the six lookup docs) under the Zotero root,
+ *   2. each lookup doc's entries, recursively for the nested Collections and Dates trees.
+ * Same-name children that only become siblings AFTER a parent fold surface on the next preview.
  */
-async function mergeDuplicateLookupRems(
-  plugin: RNPlugin,
-  ctx: SyncContext,
-  log?: SyncLog
-): Promise<number> {
+export async function findLookupDuplicates(plugin: RNPlugin, log?: SyncLog): Promise<LookupDuplicate[]> {
+  const out: LookupDuplicate[] = [];
   const root = await plugin.rem.findByName([HIERARCHY.root], null);
-  if (!root) return 0;
-  let merged = 0;
+  if (!root) return out;
 
-  // Manual fold (NOT rem.merge): RemNote's native merge was observed to leave the duplicate's
-  // inbound references DANGLING (item docs' Collection(s) rendered "Loading" afterwards), so we
-  // move the children, re-point every referencing rem's rich text to the canonical id ourselves,
-  // and only then remove the duplicate.
-  const foldInto = async (canonical: PluginRem, dup: PluginRem): Promise<void> => {
-    for (const child of await dup.getChildrenRem()) {
-      if (await isStructuralRem(child)) continue; // powerup machinery dies with the dup
-      await child.setParent(canonical);
-    }
-    for (const refRem of await dup.remsReferencingThis()) {
-      const txt = refRem.text;
-      if (!txt) continue;
-      const newTxt = txt.map((el) => {
-        if (typeof el === 'string') return el;
-        const obj = el as { i?: string; _id?: string };
-        if (obj.i === 'q' && obj._id === dup._id)
-          return { ...(el as Record<string, unknown>), _id: canonical._id };
-        return el;
-      });
-      await refRem.setText(newTxt as RichTextInterface);
-    }
-    // Chunked, like every other deletion: `foldInto` only re-parents NON-structural children, so a
-    // dup can still carry a subtree big enough to raise RemNote's unanswerable confirm dialog —
-    // and this path runs during PREVIEW ("Get"), before Apply is ever clicked.
-    await removeRemDeep(dup, SAFE_DELETE_SUBTREE, log, 'merge duplicate');
-  };
-
-  const mergeUnder = async (parent: PluginRem, label: string, recurse: boolean): Promise<void> => {
+  const groupByName = async (parent: PluginRem, only?: Set<string>): Promise<Map<string, PluginRem[]>> => {
     const groups = new Map<string, PluginRem[]>();
     for (const child of await parent.getChildrenRem()) {
       if (await isStructuralRem(child)) continue;
       const name = (await remName(plugin, child)).trim();
-      if (!name) continue;
+      if (!name || (only && !only.has(name))) continue;
       const g = groups.get(name);
       if (g) g.push(child);
       else groups.set(name, [child]);
     }
+    return groups;
+  };
+
+  const collect = async (groups: Map<string, PluginRem[]>, docName: string): Promise<void> => {
     for (const [name, rems] of groups) {
       if (rems.length < 2) continue;
       rems.sort((a, b) => a.createdAt - b.createdAt);
-      const canonical = rems[0];
       for (let i = 1; i < rems.length; i++) {
-        try {
-          await foldInto(canonical, rems[i]);
-          merged += 1;
-          log?.log('plan', `  merged duplicate "${name}" under ${label} (kept oldest ${canonical._id}).`);
-        } catch (err) {
-          log?.log('plan', `  MERGE FAILED for duplicate "${name}" under ${label}: ${errMsg(err)}`);
-        }
-      }
-    }
-    if (recurse) {
-      // Merging two parents can land same-name children next to each other — dedupe each level.
-      for (const child of await parent.getChildrenRem()) {
-        if (await isStructuralRem(child)) continue;
-        const childName = (await remName(plugin, child)).trim();
-        if (childName) await mergeUnder(child, `${label}/${childName}`, true);
+        const duplicate = rems[i];
+        out.push({
+          id: `ld:${duplicate._id}`,
+          docName,
+          name,
+          canonical: rems[0],
+          duplicate,
+          childCount: (await movableChildren(duplicate)).length,
+          referenceCount: (await duplicate.remsReferencingThis()).length,
+        });
       }
     }
   };
 
-  // Top-level docs first (a duplicated "Collections"/"Items" doc hides half the tree), then
-  // the entries inside each lookup doc. Only our known doc names are deduped at root level —
-  // anything else under the Zotero root is the user's.
+  const scanUnder = async (parent: PluginRem, label: string, recurse: boolean): Promise<void> => {
+    const groups = await groupByName(parent);
+    await collect(groups, label);
+    if (!recurse) return;
+    for (const [childName, rems] of groups) {
+      // Descend into every copy: a nested duplicate under a to-be-folded parent is still a
+      // duplicate, and folds are keyed by rem id, so apply order does not matter.
+      for (const child of rems) await scanUnder(child, `${label}/${childName}`, true);
+    }
+  };
+
+  // Top-level docs first (a duplicated "Collections"/"Items" doc hides half the tree). Only our
+  // known doc names are examined at root level — anything else under the Zotero root is the user's.
   const topLevel = new Set<string>([
     HIERARCHY.items,
     HIERARCHY.types,
@@ -1178,28 +1210,7 @@ async function mergeDuplicateLookupRems(
     HIERARCHY.collections,
     HIERARCHY.statuses,
   ]);
-  const rootGroups = new Map<string, PluginRem[]>();
-  for (const child of await root.getChildrenRem()) {
-    if (await isStructuralRem(child)) continue;
-    const name = (await remName(plugin, child)).trim();
-    if (!topLevel.has(name)) continue;
-    const g = rootGroups.get(name);
-    if (g) g.push(child);
-    else rootGroups.set(name, [child]);
-  }
-  for (const [name, rems] of rootGroups) {
-    if (rems.length < 2) continue;
-    rems.sort((a, b) => a.createdAt - b.createdAt);
-    for (let i = 1; i < rems.length; i++) {
-      try {
-        await foldInto(rems[0], rems[i]);
-        merged += 1;
-        log?.log('plan', `  merged duplicate top-level doc "${name}" (kept oldest ${rems[0]._id}).`);
-      } catch (err) {
-        log?.log('plan', `  MERGE FAILED for top-level doc "${name}": ${errMsg(err)}`);
-      }
-    }
-  }
+  await collect(await groupByName(root, topLevel), HIERARCHY.root);
 
   for (const docName of [
     HIERARCHY.types,
@@ -1211,14 +1222,59 @@ async function mergeDuplicateLookupRems(
   ]) {
     const doc = await plugin.rem.findByName([docName], root._id);
     if (!doc) continue;
-    // Collections + Dates are NESTED trees, so dedupe their entries recursively.
-    await mergeUnder(doc, docName, docName === HIERARCHY.collections || docName === HIERARCHY.dates);
+    // Collections + Dates are NESTED trees, so scan their entries recursively.
+    await scanUnder(doc, docName, docName === HIERARCHY.collections || docName === HIERARCHY.dates);
   }
 
-  if (merged > 0)
-    log?.log('plan', `Merged ${merged} duplicate lookup rem(s) — kept the oldest of each name.`);
-  return merged;
+  if (out.length)
+    log?.log('plan', `Found ${out.length} duplicate lookup rem(s) that can be folded into the oldest copy.`);
+  return out;
 }
+
+/**
+ * Fold ONE duplicate lookup rem into its canonical twin — apply-time only, one ticked row each.
+ * Manual fold, NOT `rem.merge`: RemNote's native merge was observed to leave the duplicate's inbound
+ * references DANGLING (item docs' Collection(s) rendered "Loading"); do not reintroduce it.
+ * Throws on failure so the caller counts the row as failed and the rem is left in place.
+ */
+export async function foldLookupDuplicate(plugin: RNPlugin, dup: LookupDuplicate, log?: SyncLog): Promise<void> {
+  const { canonical, duplicate } = dup;
+  // Moved children keep their order: `setParent` PREPENDS when given no index (SDK: "added to the
+  // front"), which used to REVERSE a moved subtree — so append with a running position instead.
+  let pos = (await canonical.getChildrenRem()).length;
+  for (const child of await movableChildren(duplicate)) {
+    await child.setParent(canonical, pos);
+    pos += 1;
+  }
+  const repoint = (rt: RichTextInterface): RichTextInterface =>
+    rt.map((el) => {
+      if (typeof el === 'string') return el;
+      const obj = el as { i?: string; _id?: string };
+      if (obj.i === 'q' && obj._id === duplicate._id)
+        return { ...(el as Record<string, unknown>), _id: canonical._id };
+      return el;
+    }) as RichTextInterface;
+  for (const refRem of await duplicate.remsReferencingThis()) {
+    // BOTH fields. A powerup property's VALUE lives in the property rem's `backText`, so rewriting
+    // only `text` (the pre-2026-09-05 behaviour) left every item doc's Author/Type/Publication/
+    // Collection/Status reference pointing at the rem about to be deleted — the very "Loading"
+    // symptom this manual fold exists to avoid.
+    if (refRem.text) await refRem.setText(repoint(refRem.text));
+    if (refRem.backText) await refRem.setBackText(repoint(refRem.backText));
+  }
+  // Chunked like every other deletion — a dup can still carry a subtree big enough to raise
+  // RemNote's unanswerable bulk-delete confirmation (see removeRemDeep).
+  await removeRemDeep(duplicate, SAFE_DELETE_SUBTREE, log, `fold duplicate "${dup.name}"`);
+  log?.log('apply', `  folded duplicate "${dup.name}" under ${dup.docName} into the oldest copy.`);
+}
+
+/**
+ * Let the host breathe between apply items. A large apply is otherwise one tight burst of thousands
+ * of SDK round-trips with no chance for GC, and the popup iframe can exhaust its renderer memory —
+ * the browser then kills the frame mid-write. A MACROTASK (setTimeout), not a microtask: only that
+ * actually lets the event loop run.
+ */
+const yieldToHost = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 /**
  * How many rems a single `remove()` may take out before RemNote demands confirmation.
@@ -1351,11 +1407,18 @@ async function buildNoteForDoc(
   doc: PluginRem,
   name: string,
   rich: boolean,
-  hashOverride?: string
+  hashOverride?: string,
+  abstract?: string
 ): Promise<BuiltNote | null> {
   const ref = (id: string) => resolveRefName(plugin, ctx, id);
   const lines = await collectBody(plugin, doc, ref, rich);
   if (!lines.length) return null;
+  // ABSTRACT-ONLY body → nothing to push (mo, 2026-09-05). The abstract is the one bullet Remzot itself
+  // writes on create/adopt, and Zotero already holds that text in the item's own `abstractNote` — a note
+  // would just echo the item's field back at it. Only user-written content earns a note. (A note that
+  // was pushed for such a doc earlier is left alone: nothing is staged, so nothing is touched.)
+  const abs = (abstract ?? '').trim();
+  if (abs && lines.length === 1 && lines[0].kind === 'bullet' && lines[0].text.trim() === abs) return null;
 
   // Backlinks ("Referenced by"), kept per mo's 2026-09-01 decision. Best-effort: a failure here
   // costs a section, never the push.
@@ -1398,9 +1461,9 @@ export async function computeSyncPlan(
   log?.section('Compute sync plan (match by Zotero key)');
   log?.log('plan', `Zotero items to reconcile: ${items.length} (unique keys: ${zoteroKeys.size}).`);
 
-  // Housekeeping FIRST (before any diff resolves references or any name map is cached): fold
-  // duplicate lookup rems into their oldest copy so this run sees a clean tree.
-  await mergeDuplicateLookupRems(plugin, ctx, log);
+  // Housekeeping is now PLAN-ONLY: report the duplicate lookup rems as their own opt-out rows and
+  // fold them at apply time. (computeSyncPlan writes NOTHING to the KB — see findLookupDuplicates.)
+  const toFoldDuplicates = await findLookupDuplicates(plugin, log);
 
   const itemsParent = await findItemsParent(plugin);
   if (!itemsParent) {
@@ -1566,12 +1629,12 @@ export async function computeSyncPlan(
       // needs no new powerup slot (slots are permanent — see the Gotchas).
       if (ctx.notesByParent) {
         try {
-          const probe = await buildNoteForDoc(plugin, ctx, child, name, false);
+          const probe = await buildNoteForDoc(plugin, ctx, child, name, false, undefined, item.data.abstractNote);
           if (probe && !probe.empty) {
             const existing = ctx.notesByParent.get(key);
             const storedHash = existing ? extractNoteHash(existing.note) : null;
             if (storedHash !== probe.hash) {
-              const built = (await buildNoteForDoc(plugin, ctx, child, name, true, probe.hash)) ?? probe;
+              const built = (await buildNoteForDoc(plugin, ctx, child, name, true, probe.hash, item.data.abstractNote)) ?? probe;
               if (built.tooLong) {
                 log?.log(
                   'plan',
@@ -1716,6 +1779,7 @@ export async function computeSyncPlan(
     updateGroups: buildGroups(ctx, toUpdate),
     toMatch,
     toDelete: finalDelete,
+    toFoldDuplicates,
     toPushTags,
     toPushNotes,
     alreadyPresent,
@@ -1728,13 +1792,17 @@ export async function computeSyncPlan(
 // Lifted to module scope so the bulk-sync create/adopt paths AND the on-page "Add related item"
 // flow run through ONE code path (no copy-paste drift).
 
-/** Write-once abstract: a plain text bullet appended to the doc body (create/adopt only). */
+/**
+ * Write-once abstract: a plain text bullet APPENDED to the doc body (create/adopt only). On a fresh
+ * doc that is the first bullet; on the ADOPT path it lands BELOW the user's existing notes — the
+ * position-less `setParent` used until 2026-09-05 prepended it above them.
+ */
 async function appendAbstractRem(plugin: RNPlugin, parent: PluginRem, abstract: string): Promise<void> {
   if (!abstract) return;
   const a = await plugin.rem.createRem();
   if (!a) return;
   await a.setText([abstract]);
-  await a.setParent(parent);
+  await appendUnder(a, parent);
 }
 
 /**
@@ -1858,7 +1926,9 @@ async function makeIncremental(
     }
     // Priority: inherited from the tagged parent folder when present, else IE's default.
     await rem.setPowerupProperty(IE.powerup, IE.prioritySlot, [setup.priority]);
-    const priorityNum = Number(setup.priority) || IE.defaultPriority;
+    // `|| default` turned an inherited priority of 0 into 10; only a NON-number falls back.
+    const parsedPriority = Number(setup.priority);
+    const priorityNum = Number.isFinite(parsedPriority) ? parsedPriority : IE.defaultPriority;
     // repHist: a single 'madeIncremental' marker — the exact shape IE's scheduler counts reps from.
     const marker = { date: Date.now(), scheduled: Date.now(), eventType: 'madeIncremental', priority: priorityNum };
     await rem.setPowerupProperty(IE.powerup, IE.repHistSlot, [JSON.stringify([marker])]);
@@ -1916,6 +1986,8 @@ export async function createItemDoc(
 
 /** The subset of changes to actually apply (after the user's per-item selection). */
 export interface ApplySelection {
+  /** Duplicate lookup rems the user left ticked — folded FIRST so later writes see one canonical rem each. */
+  toFoldDuplicates: LookupDuplicate[];
   toCreate: CreateEntry[];
   /** Update items with the specific fields the user ticked for each. */
   toUpdate: { entry: UpdateEntry; fields: ReadonlySet<UpdatableField> }[];
@@ -1948,6 +2020,7 @@ export async function applySyncPlan(
   callbacks: ApplyCallbacks = {},
   log?: SyncLog
 ): Promise<{
+  folded: number;
   created: number;
   updated: number;
   matched: number;
@@ -1997,6 +2070,32 @@ export async function applySyncPlan(
     else if (outcome === 'failed') statusTagFailed += 1;
   };
 
+  // Fold phase FIRST, and only for ticked rows: later writes then reference one canonical rem each.
+  // The lookup caches were filled while planning against the PRE-fold tree, so drop them — a cached
+  // entry could hand back a rem a fold just removed.
+  let folded = 0;
+  let foldFailed = 0;
+  if (selection.toFoldDuplicates.length > 0) {
+    for (const dup of selection.toFoldDuplicates) {
+      let ok = true;
+      try {
+        await foldLookupDuplicate(plugin, dup, log);
+        folded += 1;
+      } catch (err) {
+        ok = false;
+        foldFailed += 1;
+        log?.log('apply', `  FOLD FAILED for duplicate "${dup.name}" under ${dup.docName}: ${errMsg(err)}`);
+      }
+      onItemDone(dup.id, ok);
+      await yieldToHost();
+    }
+    ctx.lookupCache.clear();
+    ctx.childNameMaps.clear();
+    ctx.collectionRemByKey.clear();
+    ctx.collectionsBuilt = false;
+    if (foldFailed) log?.log('apply', `folds: ${folded} done, ${foldFailed} failed.`);
+  }
+
   let deleted = 0;
   let deleteFailed = 0;
   let delListed = 0;
@@ -2015,6 +2114,7 @@ export async function applySyncPlan(
       log?.log('apply', `  DELETE FAILED "${entry.name || '(untitled)'}": ${errMsg(err)}`);
     }
     onItemDone(entry.id, ok);
+    await yieldToHost();
   }
   if (deleted > LOG_LIST_CAP)
     log?.log('apply', `  … (${deleted - LOG_LIST_CAP} more successful deletions not individually listed)`);
@@ -2052,6 +2152,7 @@ export async function applySyncPlan(
       log?.log('apply', `  UPDATE FAILED "${sel.entry.name}": ${errMsg(err)}`);
     }
     onItemDone(sel.entry.id, ok);
+    await yieldToHost();
   }
 
   // Push phase runs after pull-updates so an item's stored version ends on the post-push value.
@@ -2071,6 +2172,7 @@ export async function applySyncPlan(
       log?.log('apply', `  PUSH FAILED "${entry.name}" (key ${entry.itemKey}): ${errMsg(err)}`);
     }
     onItemDone(entry.id, ok);
+    await yieldToHost();
   }
 
   // Notes phase: write each item's Remnote notes to Zotero as a child note. Updates the note we
@@ -2100,6 +2202,7 @@ export async function applySyncPlan(
       log?.log('apply', `  NOTES FAILED "${entry.name}" (item ${entry.itemKey}): ${errMsg(err)}`);
     }
     onItemDone(entry.id, ok);
+    await yieldToHost();
   }
 
   if (noteCreates.length > 0) {
@@ -2134,6 +2237,7 @@ export async function applySyncPlan(
         );
       }
       onItemDone(entry.id, ok);
+      await yieldToHost();
     }
   }
 
@@ -2175,6 +2279,7 @@ export async function applySyncPlan(
         log?.log('apply', `  ADOPT FAILED "${entry.name}" (key ${entry.item.key}): ${errMsg(err)}`);
       }
       onItemDone(entry.id, ok);
+      await yieldToHost();
     }
   }
 
@@ -2201,6 +2306,7 @@ export async function applySyncPlan(
         log?.log('apply', `  CREATE FAILED "${entry.name}" (key ${entry.key}): ${errMsg(err)}`);
       }
       onItemDone(entry.id, ok);
+      await yieldToHost();
     }
   }
 
@@ -2214,7 +2320,7 @@ export async function applySyncPlan(
     'apply',
     `Finished. Created ${created} (${createFailed} failed), updated ${updated} (${updateFailed} failed), matched ${matched} (${matchFailed} failed), pushed ${pushed} (${pushFailed} failed), deleted ${deleted} (${deleteFailed} failed), status tag-backs ${statusTagged} (${statusTagFailed} failed).`
   );
-  return { created, updated, matched, pushed, notesPushed, deleted };
+  return { folded, created, updated, matched, pushed, notesPushed, deleted };
 }
 
 // ───────────────────────── Single-item sync (on-page menu) ─────────────────────────
@@ -2314,8 +2420,8 @@ export async function syncSingleItem(
     // Hash from the CHEAP pass so the marker stays comparable with computeSyncPlan's probe —
     // otherwise the per-item Sync stamps a rich-pass hash the bulk detector can never match, and
     // the item re-stages on every subsequent preview.
-    const probe = await buildNoteForDoc(plugin, ctx, rem, wantName, false);
-    const built = await buildNoteForDoc(plugin, ctx, rem, wantName, true, probe?.hash);
+    const probe = await buildNoteForDoc(plugin, ctx, rem, wantName, false, undefined, item.data.abstractNote);
+    const built = await buildNoteForDoc(plugin, ctx, rem, wantName, true, probe?.hash, item.data.abstractNote);
     if (built && !built.empty) {
       if (built.tooLong) {
         log?.log('apply', `  notes skipped — ${built.html.length} chars exceeds Zotero's limit.`);

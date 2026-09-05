@@ -364,12 +364,22 @@ export const renderHtml = (src: NoteSource, hash: string): string => {
   // HTML differ from what we pushed.
   let open = 0; // number of open <ul>
   let liOpen = false; // the innermost <ul> has an unclosed <li>
+  let liInline = false; // …and nothing (no nested <ul>) has been emitted since its opening line
+  // Close the open <li>: on the SAME line as its text when it holds no nested list (`<li>x</li>`),
+  // on its own line after the nested </ul> otherwise. Cosmetic only — the hash never sees HTML.
+  const closeLi = () => {
+    if (liInline) out[out.length - 1] += '</li>';
+    else out.push('</li>');
+    liOpen = false;
+    liInline = false;
+  };
   const closeTo = (depth: number) => {
     while (open > depth) {
-      if (liOpen) out.push('</li>');
+      if (liOpen) closeLi();
       out.push('</ul>');
       open -= 1;
       liOpen = open > 0; // the <ul> just closed lived inside its parent's <li>
+      liInline = false;
     }
   };
   for (const l of src.lines) {
@@ -388,8 +398,9 @@ export const renderHtml = (src: NoteSource, hash: string): string => {
       out.push('<ul>');
       open += 1;
       liOpen = false;
+      liInline = false;
     }
-    if (liOpen) out.push('</li>');
+    if (liOpen) closeLi();
     const body = l.html || escapeHtml(l.text);
     const prefix =
       l.kind === 'todo-done'
@@ -401,6 +412,7 @@ export const renderHtml = (src: NoteSource, hash: string): string => {
         : '';
     out.push(`<li>${prefix}${body}`);
     liOpen = true;
+    liInline = true;
   }
   closeTo(0);
   if (src.referencedBy.length) {

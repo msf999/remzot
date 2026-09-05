@@ -17,3 +17,7 @@ CLAUDE.md
 
 # Built plugin bundle (already matched by *.zip above; listed explicitly too).
 PluginZip.zip
+# Local test harness + plan/results (see TESTPLAN.md) — gitignored on purpose.
+scripts/
+TESTPLAN.md
+TESTRESULTS.md

@@ -9,7 +9,7 @@ import {
   type SyncContext,
   type SyncPlan,
 } from '../lib/sync';
-import { fetchTopItems } from '../lib/zoteroApi';
+import { fetchTopItems, isAbortError } from '../lib/zoteroApi';
 import { STORAGE } from '../lib/consts';
 import { SyncLog } from '../lib/log';
 
@@ -128,6 +128,20 @@ export const ZoteroSync = () => {
   const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [applied, setApplied] = useState(false);
+  /** True only while applySyncPlan runs. Drives the compact panel + the disabled ✕ (item 4/5). */
+  const [applying, setApplying] = useState(false);
+  // Cancels an in-flight preview when the popup closes or a new preview starts: the paginated
+  // Zotero fetch (+ a throttle wait of up to a minute) would otherwise keep running and set state on
+  // an unmounted widget. Aborting rejects with an AbortError, which is treated as "cancelled".
+  const abortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      abortRef.current?.abort();
+    };
+  }, []);
   // 'log' starts collapsed: the diagnostic box at the popup's end is folded until opened.
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set(['log']));
   const [hasLog, setHasLog] = useState(false);
@@ -160,6 +174,22 @@ export const ZoteroSync = () => {
 
   const categories: Category[] = plan
     ? [
+        {
+          key: 'fold',
+          label: 'Will fold duplicate lookup rems',
+          count: plan.toFoldDuplicates.length,
+          rows: plan.toFoldDuplicates.map((d) => ({
+            id: d.id,
+            name: `${d.name}  ·  in ${d.docName}`,
+            detail:
+              'a duplicate copy is merged into the oldest one' +
+              (d.childCount ? `, moving ${d.childCount} child rem${d.childCount === 1 ? '' : 's'}` : '') +
+              (d.referenceCount
+                ? ` and re-pointing ${d.referenceCount} reference${d.referenceCount === 1 ? '' : 's'}`
+                : '') +
+              ', then the duplicate is deleted',
+          })),
+        },
         {
           key: 'create',
           label: 'Will create',
@@ -250,6 +280,9 @@ export const ZoteroSync = () => {
     });
 
   const handlePreview = async () => {
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
     setBusy(true);
     setStatus('Fetching items from Zotero…');
     setPlan(null);
@@ -276,15 +309,16 @@ export const ZoteroSync = () => {
         if (total > 0) reportedTotal = total; // Zotero's Total-Results — used for the partial-fetch guard
         setProgress(total > 0 ? { completed: fetched, total } : null);
         setStatus('Fetching items from Zotero…');
-      });
+      }, ac.signal);
       setProgress(null);
       setStatus(`Fetched ${items.length} items. Loading collections & item types from Zotero…`);
-      const ctx = await buildSyncContext(plugin, log, { withNotes: true });
+      const ctx = await buildSyncContext(plugin, log, { withNotes: true, signal: ac.signal });
       ctxRef.current = ctx;
       setStatus(`Comparing ${items.length} item(s) against Remnote…`);
       const newPlan = await computeSyncPlan(plugin, items, ctx, log, { reportedTotal });
 
       const allIds = [
+        ...newPlan.toFoldDuplicates.map((d) => d.id),
         ...newPlan.toCreate.map((e) => e.id),
         ...newPlan.toDelete.map((e) => e.id),
         ...newPlan.toUpdate.flatMap((e) => e.changes.map((c) => `${e.id}:${c.field}`)),
@@ -306,7 +340,7 @@ export const ZoteroSync = () => {
       }
 
       const parts = [
-        `Found ${items.length} items in Zotero — ${newPlan.alreadyPresent.length} already on Remnote, ${newPlan.toCreate.length} to create, ${newPlan.toUpdate.length} to update, ${newPlan.toMatch.length} to match, ${newPlan.toPushTags.length} to push to Zotero, ${newPlan.toPushNotes.length} note(s) to push, ${newPlan.toDelete.length} to delete.`,
+        `Found ${items.length} items in Zotero — ${newPlan.alreadyPresent.length} already on Remnote, ${newPlan.toCreate.length} to create, ${newPlan.toUpdate.length} to update, ${newPlan.toMatch.length} to match, ${newPlan.toPushTags.length} to push to Zotero, ${newPlan.toPushNotes.length} note(s) to push, ${newPlan.toFoldDuplicates.length} duplicate lookup rem(s) to fold, ${newPlan.toDelete.length} to delete.`,
       ];
       if (newPlan.emptyLibrarySkippedDeletes) {
         parts.push(
@@ -329,11 +363,16 @@ export const ZoteroSync = () => {
       }
       setStatus(parts.join(' '));
     } catch (err) {
+      if (isAbortError(err)) {
+        // The popup closed (or a new preview started) mid-fetch: not an error, and nothing to show.
+        log.log('run', 'Preview cancelled.');
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       log.log('run', `ERROR during preview: ${message}`);
-      setStatus(`Error: ${message}`);
+      if (mountedRef.current) setStatus(`Error: ${message}`);
     } finally {
-      setBusy(false);
+      if (mountedRef.current && abortRef.current === ac) setBusy(false);
     }
   };
 
@@ -352,7 +391,9 @@ export const ZoteroSync = () => {
     const toMatch = plan.toMatch.filter((e) => selected.has(e.id));
     const toPushTags = plan.toPushTags.filter((e) => selected.has(e.id));
     const toPushNotes = plan.toPushNotes.filter((e) => selected.has(e.id));
+    const toFoldDuplicates = plan.toFoldDuplicates.filter((d) => selected.has(d.id));
     const total =
+      toFoldDuplicates.length +
       toCreate.length +
       toUpdate.length +
       toMatch.length +
@@ -362,6 +403,7 @@ export const ZoteroSync = () => {
     if (total === 0) return;
 
     setBusy(true);
+    setApplying(true);
     setDone(new Set());
     setFailed(new Set());
     setProgress({ completed: 0, total });
@@ -371,12 +413,12 @@ export const ZoteroSync = () => {
     setHasLog(true);
     log.log(
       'run',
-      `Apply changes clicked — ${toCreate.length} create(s), ${toUpdate.length} update(s), ${toMatch.length} adoption(s), ${toPushTags.length} push(es), ${toPushNotes.length} note push(es), ${toDelete.length} delete(s).`
+      `Apply changes clicked — ${toCreate.length} create(s), ${toUpdate.length} update(s), ${toMatch.length} adoption(s), ${toFoldDuplicates.length} fold(s), ${toPushTags.length} push(es), ${toPushNotes.length} note push(es), ${toDelete.length} delete(s).`
     );
     try {
-      const { created, updated, matched, pushed, notesPushed, deleted } = await applySyncPlan(
+      const { folded, created, updated, matched, pushed, notesPushed, deleted } = await applySyncPlan(
         plugin,
-        { toCreate, toUpdate, toMatch, toPushTags, toPushNotes, toDelete },
+        { toFoldDuplicates, toCreate, toUpdate, toMatch, toPushTags, toPushNotes, toDelete },
         ctx,
         {
           onItemDone: (id, ok) => {
@@ -388,15 +430,15 @@ export const ZoteroSync = () => {
         log
       );
       setApplied(true);
-      const okCount = created + updated + matched + pushed + notesPushed + deleted;
+      const okCount = folded + created + updated + matched + pushed + notesPushed + deleted;
       const failCount = total - okCount;
       setStatus(
-        `Done. Created ${created}, updated ${updated}, matched ${matched}, pushed ${pushed}, ` +
+        `Done. Folded ${folded}, created ${created}, updated ${updated}, matched ${matched}, pushed ${pushed}, ` +
           `${notesPushed} note(s) pushed, deleted ${deleted}.`
       );
       await plugin.app.toast(
         `Zotero sync applied — ${created} created, ${updated} updated, ${matched} matched, ` +
-          `${pushed} pushed, ${notesPushed} notes, ${deleted} deleted${failCount > 0 ? `, ${failCount} failed` : ''}.`
+          `${pushed} pushed, ${notesPushed} notes, ${folded} folded, ${deleted} deleted${failCount > 0 ? `, ${failCount} failed` : ''}.`
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -405,6 +447,7 @@ export const ZoteroSync = () => {
       await plugin.app.toast(`Zotero sync failed: ${message}`);
     } finally {
       setBusy(false);
+      setApplying(false);
     }
   };
 
@@ -426,6 +469,7 @@ export const ZoteroSync = () => {
       plan.toMatch.filter((e) => selected.has(e.id)).length +
       plan.toPushTags.filter((e) => selected.has(e.id)).length +
       plan.toPushNotes.filter((e) => selected.has(e.id)).length +
+      plan.toFoldDuplicates.filter((d) => selected.has(d.id)).length +
       plan.toUpdate.filter((e) => e.changes.some((c) => selected.has(`${e.id}:${c.field}`))).length
     : 0;
   const canApply = !busy && !applied && selectedCount > 0;
@@ -448,9 +492,10 @@ export const ZoteroSync = () => {
         <button
           type="button"
           onClick={() => plugin.widget.closePopup()}
-          title="Close"
+          disabled={applying}
+          title={applying ? 'Wait — closing now would leave the knowledge base half-written' : 'Close'}
           aria-label="Close"
-          className="shrink-0 p-2 rounded-md rn-clr-content-secondary cursor-pointer"
+          className="shrink-0 p-2 rounded-md rn-clr-content-secondary cursor-pointer disabled:opacity-50 disabled:cursor-default"
         >
           <svg
             width="20"
@@ -503,7 +548,18 @@ export const ZoteroSync = () => {
       {status && <div className="text-sm rn-clr-content-secondary">{status}</div>}
 
       <div className="flex-1 min-h-0 overflow-auto rounded-md rn-clr-background-secondary p-3">
-        {categories.length === 0 ? (
+        {applying ? (
+          // A big apply re-rendering the FULL row list on every onItemDone is one of the two sinks
+          // that can exhaust the popup iframe's memory (the other is the apply loop never yielding —
+          // see yieldToHost). Show a light counter instead; the list, with ✅/❌, returns when done.
+          <div className="flex flex-col gap-1 py-2">
+            <span className="text-sm font-semibold">Applying changes…</span>
+            <span className="text-sm rn-clr-content-secondary">
+              {done.size} done{failed.size ? ` · ${failed.size} failed` : ''}. The detailed list is hidden
+              while applying to keep the popup light; it reappears with per-row ✅/❌ when finished.
+            </span>
+          </div>
+        ) : categories.length === 0 ? (
           <span className="text-sm rn-clr-content-tertiary">
             Click “Get from Zotero” to preview the changes.
           </span>
@@ -695,7 +751,7 @@ export const ZoteroSync = () => {
           </div>
         )}
 
-        {hasLog && (
+        {hasLog && !applying && (
           <div className="mt-4 pt-2 border-t border-gray-300">
             <div className="flex items-center gap-2">
               <button
