@@ -352,11 +352,15 @@ export const ZoteroSync = () => {
           `Fetched ${items.length} item(s) but Zotero reports ${reportedTotal || 'more'} — the fetch looks incomplete, so deletions of "missing" items were suppressed. Re-run once the full library loads.`
         );
       }
+      // ALL SEVEN categories, or the line contradicts itself: gated on only five of them, a preview
+      // whose sole staged work was note pushes or duplicate folds still claimed everything was in sync.
       if (
+        newPlan.toFoldDuplicates.length === 0 &&
         newPlan.toCreate.length === 0 &&
         newPlan.toUpdate.length === 0 &&
         newPlan.toMatch.length === 0 &&
         newPlan.toPushTags.length === 0 &&
+        newPlan.toPushNotes.length === 0 &&
         newPlan.toDelete.length === 0
       ) {
         parts.push('Everything is already in sync.');

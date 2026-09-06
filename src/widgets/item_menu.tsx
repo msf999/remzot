@@ -1053,7 +1053,12 @@ function ItemMenu() {
     let cancelled = false;
     const res = sem.doi === doi ? sem.result : null;
     const dois = [doi];
-    if (res) for (const p of [...res.references, ...res.citations, ...res.related]) if (p.doi) dois.push(p.doi);
+    // ALL FOUR lists incl. relatedWorks — the Related tab is a first-class tab, and leaving it out of
+    // the batch left every row there with an empty metrics line and no journal value (so it scored -1
+    // in the journal-impact sort). `related` stays: it is the in-library subset, cheap to include.
+    if (res)
+      for (const p of [...res.references, ...res.citations, ...res.related, ...res.relatedWorks])
+        if (p.doi) dois.push(p.doi);
     void fetchSciteTallies(dois).then((m) => {
       if (!cancelled) setSciteMap(m);
     });
