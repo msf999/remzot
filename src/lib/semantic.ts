@@ -23,6 +23,7 @@
  */
 import type { RNPlugin } from '@remnote/plugin-sdk';
 import { HIERARCHY, SLOTS, ZOTERO_ITEM_POWERUP } from './consts';
+import { safeRichTextToString } from './notes';
 
 /** Short source labels shown per item, e.g. "(Semantic, Crossref)". */
 export type SourceName = 'Semantic' | 'Crossref' | 'OpenAlex' | 'OpenCitations';
@@ -1223,7 +1224,7 @@ async function buildLibraryDoiIndex(plugin: RNPlugin): Promise<Map<string, LibDo
       if (!(await child.hasPowerup(ZOTERO_ITEM_POWERUP))) continue;
       const doi = normalizeDoi((await child.getPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.doi)) ?? '');
       if (!doi) continue;
-      const name = child.text ? (await plugin.richText.toString(child.text)).trim() : '';
+      const name = (await safeRichTextToString(plugin, child.text)).trim();
       if (!map.has(doi)) map.set(doi, { remId: child._id, name });
     } catch {
       // skip structural rems etc.

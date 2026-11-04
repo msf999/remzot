@@ -29,6 +29,7 @@ import { renderWidget, usePlugin, useTrackerPlugin, WidgetLocation } from '@remn
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { SESSION, SETTINGS, SLOTS, ZOTERO_ITEM_POWERUP } from '../lib/consts';
 import { BRAND_ICONS } from '../lib/brandIcons';
+import { safeRichTextToString } from '../lib/notes';
 import { addRelatedItem, buildSyncContext, type SyncContext, syncSingleItem } from '../lib/sync';
 import { fetchItemByKey } from '../lib/zoteroApi';
 import {
@@ -957,7 +958,7 @@ function ItemMenu() {
     // Guard: only render on our item docs, whatever the registration filter's semantics are.
     if (!(await rem.hasPowerup(ZOTERO_ITEM_POWERUP))) return null;
 
-    const citekey = rem.text ? (await rp.richText.toString(rem.text)).trim() : '';
+    const citekey = (await safeRichTextToString(rp, rem.text)).trim();
     const get = async (slot: string): Promise<string> => {
       try {
         return ((await rem.getPowerupProperty(ZOTERO_ITEM_POWERUP, slot)) ?? '').trim();

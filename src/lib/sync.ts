@@ -44,6 +44,7 @@ import {
   extractNoteHash,
   type NoteSource,
   remnoteDeepLink,
+  safeRichTextToString,
 } from './notes';
 import type { SyncLog } from './log';
 
@@ -215,9 +216,9 @@ async function appendUnder(child: PluginRem, parent: PluginRem): Promise<void> {
   await child.setParent(parent, (await parent.getChildrenRem()).length);
 }
 
-/** Read a document's plain-text name. */
+/** Read a document's plain-text name (never throws on odd rich text — see `safeRichTextToString`). */
 async function remName(plugin: RNPlugin, rem: PluginRem): Promise<string> {
-  return rem.text ? (await plugin.richText.toString(rem.text)).trim() : '';
+  return (await safeRichTextToString(plugin, rem.text)).trim();
 }
 
 /**
@@ -890,12 +891,20 @@ async function storedVersion(rem: PluginRem): Promise<number> {
   }
 }
 
-/** Resolve a reference rem id to its name (cached per run). */
+/**
+ * Resolve a reference rem id to its name (cached per run). A target that can't be read resolves to
+ * '' like a missing one: it costs its name, never the note that links to it (R-032).
+ */
 async function resolveRefName(plugin: RNPlugin, ctx: SyncContext, id: string): Promise<string> {
   const cached = ctx.refNameCache.get(id);
   if (cached !== undefined) return cached;
-  const r = await plugin.rem.findOne(id);
-  const name = r ? await remName(plugin, r) : '';
+  let name = '';
+  try {
+    const r = await plugin.rem.findOne(id);
+    name = r ? await remName(plugin, r) : '';
+  } catch {
+    /* unreadable target — keep '' */
+  }
   ctx.refNameCache.set(id, name);
   return name;
 }
@@ -1884,7 +1893,7 @@ async function getIncSetup(plugin: RNPlugin, ctx: SyncContext, log?: SyncLog): P
         const slotByName = new Map<string, string>();
         const anyByName = new Map<string, string>();
         for (const child of await pu.getChildrenRem()) {
-          const nm = (await plugin.richText.toString(child.text ?? [])).trim().toLowerCase();
+          const nm = (await safeRichTextToString(plugin, child.text)).trim().toLowerCase();
           if (!nm) continue;
           if (!anyByName.has(nm)) anyByName.set(nm, child._id);
           if (await child.isPowerupSlot()) slotByName.set(nm, child._id);

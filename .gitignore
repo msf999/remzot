@@ -11,9 +11,12 @@ Information/
 # Machine-local Claude Code settings (permissions etc.) — not shared.
 .claude/
 
-# Cross-machine dev log / working notes — kept local, not committed.
-# NOTE: iCloud sync is gone (2026-09-01), so this file no longer reaches other machines at all.
+# Project guide (CLAUDE.md), its dated work log (LOG.md) and to-do list (REMINDERS.md) — kept
+# local, not committed. NOTE: iCloud sync is gone (2026-09-01), so these no longer reach other
+# machines at all.
 CLAUDE.md
+/LOG.md
+/REMINDERS.md
 
 # Built plugin bundle (already matched by *.zip above; listed explicitly too).
 PluginZip.zip

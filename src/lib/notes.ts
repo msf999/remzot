@@ -142,6 +142,36 @@ export const richTextToPlain = async (
   return out.join('');
 };
 
+/**
+ * A rem's plain-text NAME computed locally: strings plus the text of formatted-text, LaTeX and
+ * annotation elements. Images and audio add nothing to a name, and references are left out —
+ * resolving them would mean host calls of their own. Only the fallback of `safeRichTextToString`.
+ */
+const plainNameText = (rt: RichTextInterface): string =>
+  (rt as any[])
+    .map((el) =>
+      typeof el === 'string' ? el : el && (el.i === 'm' || el.i === 'x' || el.i === 'n') ? el.text ?? '' : ''
+    )
+    .join('');
+
+/**
+ * `plugin.richText.toString`, except that a refusal falls back to `plainNameText` instead of
+ * throwing. The host REJECTS some of RemNote's own image elements — an upload's leftover `percent`,
+ * an image occlusion's `blocks` (CLAUDE.md Gotchas, R-032) — and every caller reads names in a loop,
+ * so one such rem used to fail a whole note, library index or preview.
+ */
+export const safeRichTextToString = async (
+  plugin: RNPlugin,
+  rt: RichTextInterface | undefined
+): Promise<string> => {
+  if (!rt || !Array.isArray(rt)) return '';
+  try {
+    return await plugin.richText.toString(rt);
+  } catch {
+    return plainNameText(rt);
+  }
+};
+
 /** RichText -> inline HTML, preserving bold/italic/code/strikethrough and inline links. */
 export const richTextToHtml = async (
   rt: RichTextInterface | undefined,
