@@ -45,10 +45,12 @@ async function onActivate(plugin: ReactRNPlugin) {
     id: SETTINGS.initIncremental,
     title: 'Make new items Incremental (Incremental Everything)',
     description:
-      'When ON, every item this plugin CREATES — added from the on-page menu OR by a global sync — is ' +
-      'also turned into an Incremental Everything item (added to its queue, due today, default priority). ' +
-      'Requires the Incremental Everything plugin to be installed; otherwise this is silently skipped. ' +
-      'Existing/adopted docs are not affected.',
+      'When ON, every item this plugin CREATES — added from the on-page menu OR by a global sync — or ' +
+      'ADOPTS (an existing doc named by its citation key) is also turned into an Incremental Everything ' +
+      'item: added to its queue, due today, with the priority of the Items or Zotero folder if that folder ' +
+      'is Incremental, else the default. Docs already Incremental, and docs you dismissed in Incremental ' +
+      'Everything, are left as they are. Requires the Incremental Everything plugin to be installed; ' +
+      'otherwise this is silently skipped.',
     defaultValue: false,
   });
 
