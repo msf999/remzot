@@ -6,7 +6,8 @@
  * citekey hyperlinked to the doc's RemNote deep link, body bullets nested 2 spaces per level,
  * headings as #/##/###, todos as [ ]/[x], portals as "Query/portal:", and a trailing
  * "Referenced by" section. Per mo's decisions (2026-09-01): entire body verbatim (abstract
- * included), rendered to real HTML, `^remId` anchors DROPPED, Referenced by KEPT.
+ * included), rendered to real HTML, `^remId` anchors DROPPED, Referenced by KEPT. The one thing
+ * left out is RemNote's hidden References portal (see `isSearchPortal`) — it is not body content.
  *
  * CHANGE DETECTION: we hash the SOURCE markdown and append the hash to the note as a visible
  * trailing marker. Zotero sanitizes and normalizes note HTML server-side ("the string you GET
@@ -15,7 +16,7 @@
  * Hashing the source sidesteps it, and keeping the hash IN the note means no new powerup slot
  * (slots are permanent -- see the Gotchas in CLAUDE.md).
  */
-import { RNPlugin, RichTextInterface, RemType } from '@remnote/plugin-sdk';
+import { PORTAL_TYPE, RNPlugin, RichTextInterface, RemType } from '@remnote/plugin-sdk';
 
 /** A Rem handle. The SDK exports the single-Rem type as PluginRem (the class is RemObject). */
 type AnyRem = any;
@@ -236,6 +237,11 @@ export interface NoteLine {
   kind: 'bullet' | 'heading' | 'todo-done' | 'todo-open' | 'portal' | 'document';
   headingLevel?: 1 | 2 | 3;
   url?: string;
+  /**
+   * The line belongs to RemNote's hidden References portal (or sits under it). Never written to
+   * Zotero; collected only so the hash notes had before these were skipped can be reproduced.
+   */
+  hidden?: boolean;
 }
 
 export interface NoteSource {
@@ -260,6 +266,17 @@ const swallow = async <T,>(p: Promise<T>, fallback: T): Promise<T> => {
 };
 
 /**
+ * Is this rem a SEARCH portal? RemNote keeps every document's References section — the
+ * "N References · Hide" panel at the bottom — as one of these, stored INSIDE the document
+ * (`query:<the doc>`, with portals under it), and makes it the first time a doc with backlinks is
+ * shown. It never appears in the doc, but `getChildrenRem()` returns it, so the notes writer and the
+ * Items scan must skip it (R-031; confirmed by experiment 2026-11-05). Only portals pay a host call.
+ */
+export const isSearchPortal = async (rem: AnyRem): Promise<boolean> =>
+  rem?.type === RemType.PORTAL &&
+  (await swallow(Promise.resolve(rem.getPortalType?.()), undefined)) === PORTAL_TYPE.SEARCH_PORTAL;
+
+/**
  * Is this child one of RemNote's own powerup property rems rather than user content?
  * Only the doc's DIRECT children need this test -- anything under a genuine body bullet is body
  * content -- which keeps it to ~1 call per direct child instead of one per descendant.
@@ -280,12 +297,16 @@ export const isPropertyRem = async (rem: AnyRem): Promise<boolean> => {
  * rich-text flattening, no per-rem property round-trips. `rich` = true additionally resolves
  * heading level / todo state / sub-document links, and is only worth paying for on the items
  * whose hash actually changed.
+ *
+ * Lines from RemNote's hidden References portal come back flagged `hidden`, their links resolved
+ * through `refHidden` (default `ref`) so a caller can keep them out of its unreadable-link count.
  */
 export const collectBody = async (
   plugin: RNPlugin,
   doc: AnyRem,
   ref: RefResolver,
-  rich: boolean
+  rich: boolean,
+  refHidden: RefResolver = ref
 ): Promise<NoteLine[]> => {
   const children: AnyRem[] = await swallow(doc.getChildrenRem(), []);
   const roots: AnyRem[] = [];
@@ -303,19 +324,23 @@ export const collectBody = async (
   const lines: NoteLine[] = [];
   const seen = new Set<string>();
 
-  const walk = async (rem: AnyRem, depth: number): Promise<void> => {
+  const walk = async (rem: AnyRem, depth: number, underHidden: boolean): Promise<void> => {
     if (!rem?._id || seen.has(rem._id)) return;
     seen.add(rem._id);
 
-    const text = (await richTextToPlain(rem.text, ref)).trim();
-    const html = (await richTextToHtml(rem.text, ref)).trim();
+    // RemNote's hidden References portal is still walked — flagged, never pushed — so the hash a
+    // note carried before these were skipped can be reproduced (see `buildNoteForDoc`).
+    const hidden = underHidden || (await isSearchPortal(rem));
+    const resolve = hidden ? refHidden : ref;
+    const text = (await richTextToPlain(rem.text, resolve)).trim();
+    const html = (await richTextToHtml(rem.text, resolve)).trim();
     let kind: NoteLine['kind'] = 'bullet';
     let headingLevel: NoteLine['headingLevel'];
     let url: string | undefined;
 
     if (rem.type === RemType.PORTAL) {
       kind = 'portal';
-    } else if (rich) {
+    } else if (rich && !hidden) {
       if (await swallow(Promise.resolve(rem.isTodo?.()), false)) {
         const st = await swallow(Promise.resolve(rem.getTodoStatus?.()), undefined as any);
         kind = st === 'Finished' ? 'todo-done' : 'todo-open';
@@ -330,7 +355,8 @@ export const collectBody = async (
       }
     }
 
-    if (text || kind !== 'bullet') lines.push({ depth, text, html, kind, headingLevel, url });
+    if (text || kind !== 'bullet')
+      lines.push({ depth, text, html, kind, headingLevel, url, ...(hidden ? { hidden: true } : {}) });
 
     // A sub-document's own contents live in its own note; don't inline them.
     if (kind === 'document') return;
@@ -341,11 +367,11 @@ export const collectBody = async (
     const kidIds: string[] = rem.children ?? [];
     for (const id of kidIds) {
       const kid = byId.get(id);
-      if (kid) await walk(kid, childDepth);
+      if (kid) await walk(kid, childDepth, hidden);
     }
   };
 
-  for (const r of roots) await walk(r, 0);
+  for (const r of roots) await walk(r, 0, false);
   return lines;
 };
 

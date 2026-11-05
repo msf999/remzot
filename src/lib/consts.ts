@@ -114,6 +114,20 @@ export const SESSION = {
    * (Pattern from Incremental Everything's inc_rem_counter / currentDocumentIdKey.)
    */
   navTick: 'remzot-nav-tick',
+  /**
+   * Papers that "Remzot: Convert Inline Citations" just added to Zotero/Items, as
+   * `{ doi, remId, name }[]`, set when a conversion finishes. The on-page menu (another iframe, with
+   * its own caches) watches it and turns those rows "✓ In library" without a reload.
+   */
+  addedPapers: 'remzot-added-papers',
+  /**
+   * The rem the caret was last in, and the last block selection of rems, each `{ ..., at }` (epoch
+   * ms), recorded by index.tsx on every AppEvents.EditorSelectionChanged. A command run from the
+   * Omnibar finds focus and selection already wiped (Rem2Tex measured it, 2026-10-12), so Convert
+   * Inline Citations falls back to these. Same remedy as Rem2Tex and Incremental Everything.
+   */
+  lastFocus: 'remzot-last-focus',
+  lastSelection: 'remzot-last-selection',
 } as const;
 
 /** Widget file name (matches src/widgets/zotero_sync.tsx). */
@@ -121,3 +135,6 @@ export const SYNC_WIDGET = 'zotero_sync';
 
 /** Widget file name (matches src/widgets/item_menu.tsx) — the on-page menu on item docs. */
 export const ITEM_MENU_WIDGET = 'item_menu';
+
+/** Widget file name (matches src/widgets/convert_citations.tsx) — the Convert Inline Citations popup. */
+export const CONVERT_WIDGET = 'convert_citations';

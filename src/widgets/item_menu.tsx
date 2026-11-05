@@ -988,6 +988,25 @@ function ItemMenu() {
     setPickerFor(null);
   }, [docKey]);
 
+  // Papers that "Remzot: Convert Inline Citations" just added (its popup is another iframe, with its
+  // own caches): flip their rows to "✓ In library" here too, without a refetch.
+  const addedByConvert = useTrackerPlugin<{ doi: string; remId: string; name: string }[]>(
+    async (rp) => ((await rp.storage.getSession(SESSION.addedPapers)) as { doi: string; remId: string; name: string }[]) ?? [],
+    []
+  );
+  useEffect(() => {
+    if (!addedByConvert?.length) return;
+    for (const a of addedByConvert) registerAddedItem(a.doi, a.remId, a.name);
+    setJustAdded((m) => {
+      const next = new Map(m);
+      for (const a of addedByConvert) {
+        const doi = normalizeDoi(a.doi);
+        if (doi) next.set(`doi:${doi}`, a.remId);
+      }
+      return next;
+    });
+  }, [addedByConvert, docKey]);
+
   // Reset list-scoped controls whenever the open list changes (incl. closing). Selection keys could
   // collide across lists, and search/sort/page are per-list.
   useEffect(() => {

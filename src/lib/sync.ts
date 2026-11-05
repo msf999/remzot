@@ -31,6 +31,7 @@ import {
   pushItemTags,
   pushNoteHtml,
   type NoteCreateResult,
+  trashZoteroItem,
   ZOTERO_WRITE_BATCH,
   zoteroThrottleReport,
   type ZoteroNote,
@@ -42,8 +43,11 @@ import {
   buildNote,
   collectBody,
   extractNoteHash,
+  hashNoteSource,
+  isSearchPortal,
   type NoteSource,
   remnoteDeepLink,
+  renderMarkdown,
   safeRichTextToString,
 } from './notes';
 import type { SyncLog } from './log';
@@ -188,10 +192,43 @@ export interface NotePushEntry {
   hash: string;
   /** Number of body lines, for the preview row. */
   lineCount: number;
+  /**
+   * The only difference from the stored note is that RemNote's hidden References portal no longer
+   * goes into it (R-031): a one-time rewrite, which the mass-rewrite guard does not count.
+   */
+  portalCleanup?: boolean;
 }
 
-/** A built note plus the body links whose target could not be read (see `buildNoteForDoc`). */
-export type NoteBuild = BuiltNote & { unresolved: number; unresolvedIds: string[] };
+/**
+ * A built note plus the body links whose target could not be read (see `buildNoteForDoc`), and
+ * `legacyHash` — the hash the note had before hidden References portals were skipped (equal to
+ * `hash` when the doc has none). Meaningful on the cheap pass, the one whose hash is compared.
+ */
+export type NoteBuild = BuiltNote & { unresolved: number; unresolvedIds: string[]; legacyHash: string };
+
+/** Why a doc has no note to push: no body of the user's, or only the abstract Remzot wrote. */
+export type NoNoteReason = 'empty' | 'abstract-only';
+
+/**
+ * A Remzot-written Zotero note whose RemNote doc no longer holds anything of the user's — an empty
+ * body, or only the abstract Remzot wrote. An empty body stages nothing, so without this the note
+ * would stay in Zotero for good. Offered UNTICKED; applying moves the note to Zotero's trash (R-031).
+ */
+export interface NoteTrashEntry {
+  /** Stable id (`nd:<remId>`). */
+  id: string;
+  name: string;
+  rem: PluginRem;
+  /** The Zotero item the note hangs off. */
+  itemKey: string;
+  noteKey: string;
+  noteVersion: number;
+  reason: NoNoteReason;
+  /** The item's abstract, so apply can re-check the abstract-only rule before trashing. */
+  abstract?: string;
+  /** The note's opening text, so the row shows what would go. */
+  preview: string;
+}
 
 /** The full set of changes a sync would make. */
 export interface SyncPlan {
@@ -211,6 +248,8 @@ export interface SyncPlan {
   toPushTags: PushEntry[];
   /** Items whose Remnote notes differ from the note stored in Zotero. */
   toPushNotes: NotePushEntry[];
+  /** Remzot-written notes whose doc has nothing of the user's left — offered unticked, ids `nd:<remId>`. */
+  toTrashNotes: NoteTrashEntry[];
   /** Existing docs already synced and up to date — shown read-only. */
   alreadyPresent: KeptEntry[];
   /** True when the Zotero fetch came back empty, so deletions are suppressed for safety. */
@@ -288,9 +327,11 @@ async function storedKey(rem: PluginRem): Promise<string> {
  * True for Remnote's internal/auto-generated "machinery" rems — powerup definitions, slots,
  * and property rems. These appear as children in the data model but never render as a visible
  * bullet (e.g. an auto-created "Status" rem), so they aren't user content and must never be
- * treated as items or deletion candidates.
+ * treated as items or deletion candidates. Also RemNote's hidden References portal: the
+ * `query:#Items` that sat in Items and kept coming back is the Items doc's own (R-031).
  */
 async function isStructuralRem(rem: PluginRem): Promise<boolean> {
+  if (await isSearchPortal(rem)) return true;
   const flags = await Promise.all([
     rem.isPowerup().catch(() => false),
     rem.isPowerupProperty().catch(() => false),
@@ -338,7 +379,7 @@ async function describeRem(plugin: RNPlugin, rem: PluginRem): Promise<string> {
 }
 
 /** Find the existing `Items` Rem without creating anything; undefined if absent. */
-async function findItemsParent(plugin: RNPlugin): Promise<PluginRem | undefined> {
+export async function findItemsParent(plugin: RNPlugin): Promise<PluginRem | undefined> {
   const root = await plugin.rem.findByName([HIERARCHY.root], null);
   if (!root) return undefined;
   return (await plugin.rem.findByName([HIERARCHY.items], root._id)) ?? undefined;
@@ -1437,6 +1478,10 @@ export async function removeRemDeep(
  * `unresolved` counts body links whose target could not be read (findOne found nothing or threw).
  * Their lines are missing from this build, so a caller must never PUSH a note with `unresolved > 0`
  * (R-034). Exported for the dev test hook.
+ *
+ * RemNote's hidden References portal is left out of the note and of "Referenced by" (R-031), but
+ * still read, so `legacyHash` can tell a stored note that differs ONLY by it. `why`, when passed,
+ * says why null came back: nothing of the user's in the body, or only the abstract.
  */
 export async function buildNoteForDoc(
   plugin: RNPlugin,
@@ -1445,34 +1490,50 @@ export async function buildNoteForDoc(
   name: string,
   rich: boolean,
   hashOverride?: string,
-  abstract?: string
+  abstract?: string,
+  why?: { reason?: NoNoteReason }
 ): Promise<NoteBuild | null> {
   const unresolved = new Set<string>();
-  const ref = async (id: string): Promise<string> => {
-    let found: string | null = null;
+  const lookup = async (id: string): Promise<string | null> => {
     try {
-      found = await readRefName(plugin, ctx, id);
+      return await readRefName(plugin, ctx, id);
     } catch {
-      found = null;
+      return null;
     }
+  };
+  const ref = async (id: string): Promise<string> => {
+    const found = await lookup(id);
     if (found === null) unresolved.add(id);
     return found ?? '';
   };
-  const lines = await collectBody(plugin, doc, ref, rich);
-  if (!lines.length) return null;
+  // A link inside the hidden portal is never pushed, so an unreadable one must not hold a note back.
+  const refHidden = async (id: string): Promise<string> => (await lookup(id)) ?? '';
+  const all = await collectBody(plugin, doc, ref, rich, refHidden);
+  const lines = all.filter((l) => !l.hidden);
+  if (!lines.length) {
+    if (why) why.reason = 'empty';
+    return null;
+  }
   // ABSTRACT-ONLY body → nothing to push (mo, 2026-09-05). The abstract is the one bullet Remzot itself
   // writes on create/adopt, and Zotero already holds that text in the item's own `abstractNote` — a note
   // would just echo the item's field back at it. Only user-written content earns a note. (A note that
-  // was pushed for such a doc earlier is left alone: nothing is staged, so nothing is touched.)
+  // was pushed for such a doc earlier is offered for the Zotero trash instead — R-031.)
   const abs = (abstract ?? '').trim();
-  if (abs && lines.length === 1 && lines[0].kind === 'bullet' && lines[0].text.trim() === abs) return null;
+  if (abs && lines.length === 1 && lines[0].kind === 'bullet' && lines[0].text.trim() === abs) {
+    if (why) why.reason = 'abstract-only';
+    return null;
+  }
 
   // Backlinks ("Referenced by"), kept per mo's 2026-09-01 decision. Best-effort: a failure here
   // costs a section, never the push.
   // Deduped and SORTED: remsReferencingThis carries no ordering guarantee, and these lines are
   // hashed — an unstable order would re-push the note on every machine that returns a different
   // one. Every other order-sensitive comparison in this file is normalized the same way.
+  // The doc's own hidden References portal "references" it only because its search names the doc,
+  // so it is left out — but kept aside for `legacyHash`.
+  const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name);
   const referencedBy: { name: string; url?: string }[] = [];
+  const hiddenBacklinks: { name: string; url?: string }[] = [];
   try {
     const back = (await doc.remsReferencingThis()) ?? [];
     const seenRefs = new Set<string>();
@@ -1480,9 +1541,12 @@ export async function buildNoteForDoc(
       if (!r?._id || seenRefs.has(r._id)) continue;
       seenRefs.add(r._id);
       const n = (await remName(plugin, r)).trim();
-      if (n) referencedBy.push({ name: n, url: ctx.kbId ? remnoteDeepLink(ctx.kbId, r._id, n) : undefined });
+      if (!n) continue;
+      const entry = { name: n, url: ctx.kbId ? remnoteDeepLink(ctx.kbId, r._id, n) : undefined };
+      if (await isSearchPortal(r)) hiddenBacklinks.push(entry);
+      else referencedBy.push(entry);
     }
-    referencedBy.sort((a, b) => a.name.localeCompare(b.name));
+    referencedBy.sort(byName);
   } catch {
     /* backlinks unavailable — omit the section */
   }
@@ -1493,7 +1557,53 @@ export async function buildNoteForDoc(
     lines,
     referencedBy,
   };
-  return { ...buildNote(src, hashOverride), unresolved: unresolved.size, unresolvedIds: [...unresolved] };
+  const built = buildNote(src, hashOverride);
+  // The hash this note had before hidden portals were skipped — every line and backlink, hashed
+  // exactly as Remzot used to — so a caller can tell a portal-only difference from a real edit.
+  const legacyHash =
+    all.length === lines.length && hiddenBacklinks.length === 0
+      ? built.hash
+      : hashNoteSource(
+          renderMarkdown({ ...src, lines: all, referencedBy: [...referencedBy, ...hiddenBacklinks].sort(byName) }, true)
+        );
+  return { ...built, unresolved: unresolved.size, unresolvedIds: [...unresolved], legacyHash };
+}
+
+/**
+ * Before a note is offered for — or moved to — the Zotero trash, confirm the doc really holds
+ * nothing of the user's: the children read must SUCCEED (a failed read is not an empty body), and a
+ * fresh build must still come back empty. Guards against RemNote answering nothing on one read.
+ */
+async function confirmNoUserNotes(
+  plugin: RNPlugin,
+  ctx: SyncContext,
+  doc: PluginRem,
+  name: string,
+  abstract?: string
+): Promise<boolean> {
+  try {
+    await doc.getChildrenRem();
+    return (await buildNoteForDoc(plugin, ctx, doc, name, false, undefined, abstract)) === null;
+  } catch {
+    return false;
+  }
+}
+
+/** A Zotero note's opening text for a preview row: tags stripped, title line and marker dropped. */
+function notePreview(noteHtml: string, title: string, max = 90): string {
+  const text = noteHtml
+    .replace(/<p>\s*remzot:[0-9a-f]+\s*<\/p>\s*$/i, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+  const body = text.startsWith(title) ? text.slice(title.length).trim() : text;
+  return body.length > max ? `${body.slice(0, max - 1)}…` : body || '(empty)';
 }
 
 export async function computeSyncPlan(
@@ -1528,6 +1638,7 @@ export async function computeSyncPlan(
   const toMatch: MatchEntry[] = [];
   const toPushTags: PushEntry[] = [];
   const toPushNotes: NotePushEntry[] = [];
+  const toTrashNotes: NoteTrashEntry[] = [];
   const alreadyPresent: KeptEntry[] = [];
   let skippedInternal = 0;
   let notesHeldBack = 0;
@@ -1677,11 +1788,40 @@ export async function computeSyncPlan(
       // needs no new powerup slot (slots are permanent — see the Gotchas).
       if (ctx.notesByParent) {
         try {
-          const probe = await buildNoteForDoc(plugin, ctx, child, name, false, undefined, item.data.abstractNote);
-          if (probe && !probe.empty) {
-            const existing = ctx.notesByParent.get(key);
+          const why: { reason?: NoNoteReason } = {};
+          const probe = await buildNoteForDoc(plugin, ctx, child, name, false, undefined, item.data.abstractNote, why);
+          const existing = ctx.notesByParent.get(key);
+          if (!probe) {
+            // Nothing of the user's to push. A note Remzot wrote earlier would otherwise stay in
+            // Zotero for good, so it is offered for the trash — unticked in the popup, and only when
+            // a second, strict read agrees the body holds nothing (R-031).
+            if (existing && why.reason) {
+              if (await confirmNoUserNotes(plugin, ctx, child, name, item.data.abstractNote)) {
+                toTrashNotes.push({
+                  id: `nd:${child._id}`,
+                  name,
+                  rem: child,
+                  itemKey: key,
+                  noteKey: existing.key,
+                  noteVersion: existing.version,
+                  reason: why.reason,
+                  abstract: item.data.abstractNote,
+                  preview: notePreview(existing.note, name),
+                });
+                log?.log(
+                  'plan',
+                  `  NOTE   "${shown}" — nothing of yours left (${why.reason}); its Zotero note ${existing.key} is offered for the trash.`
+                );
+              } else {
+                log?.log('plan', `  NOTE   "${shown}" read empty once but not on a second read — note left alone.`);
+              }
+            }
+          } else if (!probe.empty) {
             const storedHash = existing ? extractNoteHash(existing.note) : null;
             if (storedHash !== probe.hash) {
+              // Matching the hash from before hidden portals were skipped means the portal's lines are
+              // the ONLY difference: a one-time rewrite, not a sign of trouble (R-031).
+              const portalCleanup = !!storedHash && storedHash === probe.legacyHash;
               const built = probe.unresolved
                 ? probe
                 : (await buildNoteForDoc(plugin, ctx, child, name, true, probe.hash, item.data.abstractNote)) ?? probe;
@@ -1713,11 +1853,14 @@ export async function computeSyncPlan(
                   html: built.html,
                   hash: probe.hash,
                   lineCount: built.lineCount,
+                  ...(portalCleanup ? { portalCleanup: true } : {}),
                 });
                 if (listed < LOG_LIST_CAP)
                   log?.log(
                     'plan',
-                    `  NOTE   "${shown}" — ${existing ? 'update' : 'create'} note (${built.lineCount} line(s)).`
+                    `  NOTE   "${shown}" — ${
+                      portalCleanup ? 'update note, dropping the hidden References portal' : existing ? 'update note' : 'create note'
+                    } (${built.lineCount} line(s)).`
                   );
               }
             }
@@ -1832,8 +1975,11 @@ export async function computeSyncPlan(
   // NOTES GUARD (R-034): held-back notes were never staged, but a run that held back many — or that
   // would rewrite a large share of the existing Zotero notes at once — is a sign RemNote was not
   // answering lookups, so even the notes it did build are left for the user to tick.
+  // Rewrites that only drop RemNote's hidden References portal are expected after the R-031 fix —
+  // possibly hundreds at once — so they are not counted as a mass rewrite.
   const existingNotes = ctx.notesByParent?.size ?? 0;
-  const noteRewrites = toPushNotes.filter((n) => n.noteKey).length;
+  const portalCleanups = toPushNotes.filter((n) => n.portalCleanup).length;
+  const noteRewrites = toPushNotes.filter((n) => n.noteKey && !n.portalCleanup).length;
   const massNoteRewrite =
     noteRewrites >= MASS_NOTE_REWRITE_MIN && noteRewrites >= existingNotes * MASS_NOTE_REWRITE_SHARE;
   const notesSuspect = notesHeldBack >= NOTES_HELD_SUSPECT || massNoteRewrite;
@@ -1853,7 +1999,7 @@ export async function computeSyncPlan(
 
   log?.log(
     'plan',
-    `Plan summary → create=${toCreate.length}, update=${toUpdate.length}, match=${toMatch.length}, push=${toPushTags.length}, notes=${toPushNotes.length}, notesHeldBack=${notesHeldBack}, delete=${finalDelete.length}, skippedInternal=${skippedInternal}, emptyLibrarySkippedDeletes=${emptyLibrarySkippedDeletes}, partialFetchSkippedDeletes=${partialFetchSkippedDeletes}, notesSuspect=${notesSuspect}.`
+    `Plan summary → create=${toCreate.length}, update=${toUpdate.length}, match=${toMatch.length}, push=${toPushTags.length}, notes=${toPushNotes.length} (portalCleanup=${portalCleanups}), notesToTrash=${toTrashNotes.length}, notesHeldBack=${notesHeldBack}, delete=${finalDelete.length}, skippedInternal=${skippedInternal}, emptyLibrarySkippedDeletes=${emptyLibrarySkippedDeletes}, partialFetchSkippedDeletes=${partialFetchSkippedDeletes}, notesSuspect=${notesSuspect}.`
   );
 
   return {
@@ -1866,6 +2012,7 @@ export async function computeSyncPlan(
     toFoldDuplicates,
     toPushTags,
     toPushNotes,
+    toTrashNotes,
     alreadyPresent,
     emptyLibrarySkippedDeletes,
     partialFetchSkippedDeletes,
@@ -2088,6 +2235,8 @@ export interface ApplySelection {
   toPushTags: PushEntry[];
   /** Items whose Remnote notes will be written to Zotero as a child note. */
   toPushNotes: NotePushEntry[];
+  /** Remzot-written notes to move to Zotero's trash (R-031). Optional: absent means none. */
+  toTrashNotes?: NoteTrashEntry[];
   toDelete: DeleteEntry[];
 }
 
@@ -2117,6 +2266,7 @@ export async function applySyncPlan(
   matched: number;
   pushed: number;
   notesPushed: number;
+  notesTrashed: number;
   deleted: number;
 }> {
   const onItemDone = callbacks.onItemDone ?? (() => {});
@@ -2342,6 +2492,29 @@ export async function applySyncPlan(
     );
   }
 
+  // Trash phase (R-031): ticked Remzot-written notes whose doc holds nothing of the user's any more
+  // go to Zotero's TRASH — recoverable there — never a permanent delete. Re-checked first: a doc that
+  // has notes again keeps its Zotero note, and a note changed in Zotero since the fetch is left (412).
+  let notesTrashed = 0;
+  for (const entry of selection.toTrashNotes ?? []) {
+    let ok = false;
+    try {
+      if (!(await confirmNoUserNotes(plugin, ctx, entry.rem, entry.name, entry.abstract))) {
+        log?.log('apply', `  NOTE KEPT "${entry.name}" — the doc has notes again (or could not be read), so its Zotero note stays.`);
+      } else {
+        await trashZoteroItem(plugin, entry.noteKey, entry.noteVersion, log);
+        notesTrashed += 1;
+        ok = true;
+      }
+    } catch (err) {
+      log?.log('apply', `  NOTE TRASH FAILED "${entry.name}" (note ${entry.noteKey}): ${errMsg(err)}`);
+    }
+    onItemDone(entry.id, ok);
+    await yieldToHost();
+  }
+  if ((selection.toTrashNotes ?? []).length > 0)
+    log?.log('apply', `notes: ${notesTrashed} of ${(selection.toTrashNotes ?? []).length} moved to the Zotero trash.`);
+
   // Adopt phase: stamp identity onto citekey-matched keyless docs and backfill their metadata.
   // The rem (and its children / inbound references) is preserved — that's the whole point.
   let matched = 0;
@@ -2414,7 +2587,7 @@ export async function applySyncPlan(
     'apply',
     `Finished. Created ${created} (${createFailed} failed), updated ${updated} (${updateFailed} failed), matched ${matched} (${matchFailed} failed), pushed ${pushed} (${pushFailed} failed), deleted ${deleted} (${deleteFailed} failed), status tag-backs ${statusTagged} (${statusTagFailed} failed).`
   );
-  return { folded, created, updated, matched, pushed, notesPushed, deleted };
+  return { folded, created, updated, matched, pushed, notesPushed, notesTrashed, deleted };
 }
 
 // ───────────────────────── Single-item sync (on-page menu) ─────────────────────────
@@ -2565,6 +2738,10 @@ export async function syncSingleItem(
 export interface AddRelatedOpts {
   /** Zotero collection keys to file the new item under (e.g. the current item's collections). */
   collectionKeys?: string[];
+  /** Looks up an existing Zotero/Items doc by Zotero item key. When the DOI is already in Zotero and
+   *  this returns a doc, that doc is used as it is — no second doc, no collection change. (Convert
+   *  Inline Citations passes its library index, which also catches docs whose DOI slot is empty.) */
+  findDoc?: (itemKey: string) => string | undefined | Promise<string | undefined>;
 }
 
 /** Outcome of adding one related paper. */
@@ -2574,6 +2751,9 @@ export interface AddRelatedResult {
   remId?: string;
   /** The new Zotero item key (set even if the Remnote-doc step then failed). */
   key?: string;
+  /** What happened when ok: added to Zotero and RemNote, an existing Zotero item given its RemNote
+   *  doc, or an existing doc (from `findDoc`) used as it is. */
+  outcome?: 'created' | 'adopted' | 'existing-doc';
   /** Human-readable summary suitable for a toast. */
   message: string;
 }
@@ -2607,7 +2787,7 @@ export async function addRelatedItem(
   if (!paper.doi?.trim()) return { ok: false, message: `"${title}" has no DOI — can't add it automatically.` };
 
   // 0) Authoritative dedup: reuse an existing Zotero item with this DOI rather than POST a duplicate.
-  let item: ZoteroItem | null = await findZoteroItemByDoi(plugin, paper.doi, log);
+  let item: ZoteroItem | null = await findZoteroItemByDoi(plugin, paper.doi, log, paper.title);
   const adopted = !!item;
 
   if (!item) {
@@ -2647,6 +2827,21 @@ export async function addRelatedItem(
     }
   }
 
+  // Already in Zotero AND in RemNote (a doc the caller's DOI lookup missed): use that doc as it is.
+  if (adopted && opts.findDoc) {
+    const existing = await opts.findDoc(item.key);
+    if (existing) {
+      log?.log('apply', `${item.key} is already in Zotero and RemNote (doc ${existing}) — used as it is.`);
+      return {
+        ok: true,
+        remId: existing,
+        key: item.key,
+        outcome: 'existing-doc',
+        message: `"${displayName(item)}" is already in Zotero and Remnote.`,
+      };
+    }
+  }
+
   // If the item ALREADY existed in Zotero (adopted) and we have target collection(s) — from the
   // chevron picker or the host item — file it into them server-side (ADDITIVE union; never removes
   // its existing collections), then re-fetch so the doc's Collection(s) slot reflects the add.
@@ -2677,6 +2872,7 @@ export async function addRelatedItem(
       ok: true,
       remId: rem._id,
       key: item.key,
+      outcome: adopted ? 'adopted' : 'created',
       message: adopted
         ? `"${displayName(item)}" is already in Zotero — linked it into Remnote.`
         : `Added "${displayName(item)}" to Zotero and Remnote.`,

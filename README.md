@@ -56,7 +56,7 @@ Remnote** only — editing them in Remnote does **not** push back. For those fie
 source of truth**.
 
 ### Preview-then-apply
-The **Open Zotero Sync** popup never changes anything until you say so. It groups the plan into
+The **Remzot: Open Zotero Sync** popup never changes anything until you say so. It groups the plan into
 collapsible, selectable categories — *Will create*, *Will update*, *Will match (adopt)*,
 *Push to Zotero*, *Will delete*, and read-only *Already on Remnote* — with a live fetch progress
 bar and a completion summary. Safety guards suppress deletions when a fetch looks empty or
@@ -71,6 +71,18 @@ Below the title of every synced item, Remzot renders a quiet card with:
 - a **citations bar** — *References* · *In Library* · *Citations* · *Related* — pooled from
   Crossref, Semantic Scholar, OpenAlex, and OpenCitations, deduped by DOI, each row showing
   citation metrics and a one-click **Add to Zotero** (it lands in both Zotero and Remnote).
+
+### Convert inline citations
+Highlights and notes copied from a paper keep its citation numbers — *"as reported earlier [12, 15]"*.
+Put the cursor in such a rem (or select several, or open the paper) and run **Remzot: Convert Inline
+Citations** (quick code `zcite`). Remzot finds every `[2]`, `[2,3]`, `[34–37]` and `[3]–[5]` in that rem
+and everything under it, matches each number to the paper's reference list (from Crossref), and shows
+the matches in a popup: change any of them in its dropdown, or untick one that isn't a citation (a
+crystal direction like `[110]` starts unticked). **Convert** then writes each group as
+`\cite{‹citekey›, ‹citekey›}`, every citekey a link to that paper's document — the form Rem2Tex turns
+into LaTeX. A cited paper missing from your library is added on the way: to Zotero by its DOI, and to
+Remnote under `Zotero/Items` (and to Incremental Everything if *Make new items Incremental* is on).
+It only runs inside a paper's document under `Zotero/Items`.
 
 ---
 
@@ -147,7 +159,7 @@ Remzot talks to Zotero through its Web API, so it needs your **User ID** and a p
    - Save, then **copy the key immediately** — Zotero only shows it once.
 4. In Remnote, open the plugin's settings (**Settings → Plugins → Remzot**, or the **Build** tab
    while developing from localhost) and paste your **User ID** and **API Key**.
-5. **Type `/` anywhere** and run the **Open Zotero Sync** command (or use the quick code `zot`) to open
+5. **Type `/` anywhere** and run the **Remzot: Open Zotero Sync** command (or use the quick code `zot`) to open
    the sync popup → **Get from Zotero** to preview, then **Apply** the changes you tick.
 
 > Remzot syncs your **personal** (user) library only — group libraries aren't supported yet.

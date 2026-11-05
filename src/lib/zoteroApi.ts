@@ -663,10 +663,13 @@ export async function fetchAllNotes(
     const page = (await res.json()) as {
       key: string;
       version: number;
-      data?: { key?: string; version?: number; parentItem?: string; note?: string };
+      data?: { key?: string; version?: number; parentItem?: string; note?: string; deleted?: unknown };
     }[];
     for (const raw of page) {
       const d = raw.data ?? {};
+      // Zotero leaves the trash out of item lists by default; this guards it anyway, so a note
+      // Remzot moved to the trash is never offered again or written to (R-031).
+      if (d.deleted) continue;
       notes.push({
         key: d.key ?? raw.key,
         version: d.version ?? raw.version,
@@ -707,14 +710,17 @@ export async function fetchItemChildNotes(
   const page = (await res.json()) as {
     key: string;
     version: number;
-    data?: { key?: string; version?: number; parentItem?: string; note?: string };
+    data?: { key?: string; version?: number; parentItem?: string; note?: string; deleted?: unknown };
   }[];
-  return page.map((raw) => ({
-    key: raw.data?.key ?? raw.key,
-    version: raw.data?.version ?? raw.version,
-    parentItem: raw.data?.parentItem,
-    note: raw.data?.note ?? '',
-  }));
+  // A trashed note must never be updated: the per-item Sync would write the user's notes into it.
+  return page
+    .filter((raw) => !raw.data?.deleted)
+    .map((raw) => ({
+      key: raw.data?.key ?? raw.key,
+      version: raw.data?.version ?? raw.version,
+      parentItem: raw.data?.parentItem,
+      note: raw.data?.note ?? '',
+    }));
 }
 
 /**
@@ -764,6 +770,48 @@ export async function pushNoteHtml(
   const newVersion = Number.isFinite(parsed) && parsed > 0 ? parsed : noteVersion;
   log?.log('apply', `  updated note ${noteKey} (v${noteVersion}→v${newVersion}), ${html.length} chars.`);
   return newVersion;
+}
+
+/**
+ * Move ONE item — here, a Remzot-written child note — to Zotero's trash: a PATCH of
+ * `{ deleted: 1 }`, recoverable from the trash, never the API's permanent DELETE. Guarded by
+ * `If-Unmodified-Since-Version`, so a note changed in Zotero since the fetch is left alone (412).
+ * A 404 means it is already gone, which counts as done. Returns the new version.
+ */
+export async function trashZoteroItem(
+  plugin: RNPlugin,
+  itemKey: string,
+  itemVersion: number,
+  log?: SyncLog
+): Promise<number> {
+  const { userId, headers } = await readZoteroCreds(plugin, log);
+  const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items/${encodeURIComponent(itemKey)}`;
+  const res = await zoteroFetch(url, {
+    method: 'PATCH',
+    headers: {
+      ...headers,
+      'Content-Type': 'application/json',
+      'If-Unmodified-Since-Version': String(itemVersion),
+    },
+    body: JSON.stringify({ deleted: 1 }),
+  });
+  if (res.status === 404) {
+    log?.log('apply', `  note ${itemKey} is already gone from Zotero — nothing to trash.`);
+    return itemVersion;
+  }
+  if (res.status === 412) {
+    const msg = `Note ${itemKey} changed on Zotero since the last fetch (HTTP 412), so it was left alone.`;
+    log?.log('apply', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  if (!res.ok) {
+    const msg = `Moving note ${itemKey} to the Zotero trash failed: HTTP ${res.status} ${res.statusText}.`;
+    log?.log('apply', `ERROR: ${msg}`);
+    throw new Error(msg);
+  }
+  const parsed = Number(res.headers.get('Last-Modified-Version'));
+  log?.log('apply', `  moved note ${itemKey} to the Zotero trash.`);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : itemVersion;
 }
 
 /** One note to create, as a parent-item key plus its rendered HTML. */
@@ -1015,31 +1063,58 @@ export async function createZoteroItems(
   return out;
 }
 
+// Short words every title has; they narrow a quick search by nothing.
+const TITLE_STOPWORDS = new Set(['with', 'from', 'that', 'this', 'their', 'into', 'than', 'they', 'were', 'have', 'which', 'when', 'over', 'under']);
+
 /**
- * Authoritative "is this DOI already in my Zotero library?" check — a Zotero quick-search by the
- * bare DOI, confirmed by an exact normalized-DOI match (ignoring trashed items). Used to avoid
- * creating a DUPLICATE Zotero item when adding a related paper: the widget's local in-library gate
- * only sees the locally-loaded RemNote docs, so on a partially-loaded KB it misses items that DO
- * exist in Zotero. Best-effort: any failure returns null (so a search hiccup never blocks adding).
+ * Distinctive title words for a Zotero quick search: letters only, four or more long, stopwords left
+ * out. Zotero ANDs the words in any order (verified 2026-11-05), and LaTeX, formulas ("ZnSnN2",
+ * "$p$-type") and punctuation are written differently in Crossref and in Zotero, so only plain words
+ * are used.
+ */
+export function titleSearchWords(title: string, max = 6): string {
+  return (title.match(/[A-Za-z]+/g) ?? [])
+    .filter((w) => w.length >= 4 && !TITLE_STOPWORDS.has(w.toLowerCase()))
+    .slice(0, max)
+    .join(' ');
+}
+
+/**
+ * Authoritative "is this DOI already in my Zotero library?" check, confirmed by an exact normalized
+ * DOI match (`DOI` field, or the `DOI:` line books and reports keep in `extra`; trashed items ignored).
+ * Used to avoid creating a DUPLICATE Zotero item when adding a paper: the RemNote-side gates only see
+ * the docs Zotero/Items has.
+ *
+ * Zotero's quick search never looks in the DOI field — not even with qmode=everything, which adds
+ * only attachments' full text (verified 2026-11-05: an item's exact DOI found nothing). Until then this
+ * searched the DOI alone, so it found almost nothing and an Add could duplicate an item already in
+ * Zotero. It now searches by the paper's title words (six, then three), and keeps the DOI search as a
+ * last try for items whose PDF's indexed text carries the DOI. Best-effort: any failure returns null.
  */
 export async function findZoteroItemByDoi(
   plugin: RNPlugin,
   doi: string,
-  log?: SyncLog
+  log?: SyncLog,
+  title?: string
 ): Promise<ZoteroItem | null> {
   const clean = normalizeDoi(doi);
   if (!clean) return null;
   try {
     const { userId, headers } = await readZoteroCreds(plugin, log);
-    const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items?q=${encodeURIComponent(
-      clean
-    )}&qmode=everything&limit=50`;
-    const res = await zoteroFetch(url, { headers });
-    if (!res.ok) return null;
-    const items = (await res.json()) as ZoteroItem[];
-    for (const it of items) {
-      if (it.data?.deleted) continue;
-      if (normalizeDoi(it.data?.DOI) === clean) return it;
+    const base = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items`;
+    const searches: string[] = [];
+    for (const words of [titleSearchWords(title ?? '', 6), titleSearchWords(title ?? '', 3)]) {
+      const url = `${base}?q=${encodeURIComponent(words)}&limit=50`;
+      if (words && !searches.includes(url)) searches.push(url);
+    }
+    searches.push(`${base}?q=${encodeURIComponent(clean)}&qmode=everything&limit=50`);
+    for (const url of searches) {
+      const res = await zoteroFetch(url, { headers });
+      if (!res.ok) continue;
+      for (const it of (await res.json()) as ZoteroItem[]) {
+        if (it.data?.deleted) continue;
+        if (normalizeDoi(it.data?.DOI) === clean || normalizeDoi(parseDoiFromExtra(it.data?.extra)) === clean) return it;
+      }
     }
     return null;
   } catch (err) {

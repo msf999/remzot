@@ -229,9 +229,24 @@ export const ZoteroSync = () => {
           rows: plan.toPushNotes.map((e) => ({
             id: e.id,
             name: e.name || '(untitled)',
-            detail: `${e.noteKey ? 'update' : 'create'} Zotero note — ${e.lineCount} line${
-              e.lineCount === 1 ? '' : 's'
-            }`,
+            detail: `${
+              e.portalCleanup
+                ? "update Zotero note — only drops RemNote's hidden References portal"
+                : `${e.noteKey ? 'update' : 'create'} Zotero note`
+            } — ${e.lineCount} line${e.lineCount === 1 ? '' : 's'}`,
+          })),
+        },
+        {
+          // Never ticked by default: the user decides which notes go (R-031).
+          key: 'trash-notes',
+          label: 'Move notes to the Zotero trash',
+          count: plan.toTrashNotes.length,
+          rows: plan.toTrashNotes.map((e) => ({
+            id: e.id,
+            name: e.name || '(untitled)',
+            detail: `${
+              e.reason === 'empty' ? 'no notes of yours in RemNote' : 'only the abstract, which Zotero already has'
+            } — the note reads: ${e.preview}`,
           })),
         },
         {
@@ -342,8 +357,19 @@ export const ZoteroSync = () => {
       }
 
       const parts = [
-        `Found ${items.length} items in Zotero — ${newPlan.alreadyPresent.length} already on Remnote, ${newPlan.toCreate.length} to create, ${newPlan.toUpdate.length} to update, ${newPlan.toMatch.length} to match, ${newPlan.toPushTags.length} to push to Zotero, ${newPlan.toPushNotes.length} note(s) to push, ${newPlan.toFoldDuplicates.length} duplicate lookup rem(s) to fold, ${newPlan.toDelete.length} to delete.`,
+        `Found ${items.length} items in Zotero — ${newPlan.alreadyPresent.length} already on Remnote, ${newPlan.toCreate.length} to create, ${newPlan.toUpdate.length} to update, ${newPlan.toMatch.length} to match, ${newPlan.toPushTags.length} to push to Zotero, ${newPlan.toPushNotes.length} note(s) to push, ${newPlan.toTrashNotes.length} note(s) to trash, ${newPlan.toFoldDuplicates.length} duplicate lookup rem(s) to fold, ${newPlan.toDelete.length} to delete.`,
       ];
+      const portalCleanups = newPlan.toPushNotes.filter((e) => e.portalCleanup).length;
+      if (portalCleanups) {
+        parts.push(
+          `${portalCleanups} of the note pushes only drop RemNote's hidden References portal from the Zotero note — a one-time clean-up.`
+        );
+      }
+      if (newPlan.toTrashNotes.length) {
+        parts.push(
+          `${newPlan.toTrashNotes.length} Zotero note(s) Remzot wrote have nothing of yours left in RemNote — offered for the Zotero trash, unticked; tick the ones to remove.`
+        );
+      }
       if (newPlan.emptyLibrarySkippedDeletes) {
         parts.push(
           'Zotero returned 0 items — deletions were suppressed as a safety check; verify your credentials.'
@@ -363,7 +389,7 @@ export const ZoteroSync = () => {
           `${newPlan.notesHeldBack} note(s) held back — they link to rems RemNote couldn't read (still loading, or deleted); the Log lists them.`
         );
       }
-      // ALL SEVEN categories, or the line contradicts itself: gated on only five of them, a preview
+      // ALL EIGHT categories, or the line contradicts itself: gated on only five of them, a preview
       // whose sole staged work was note pushes or duplicate folds still claimed everything was in sync.
       if (
         newPlan.toFoldDuplicates.length === 0 &&
@@ -372,6 +398,7 @@ export const ZoteroSync = () => {
         newPlan.toMatch.length === 0 &&
         newPlan.toPushTags.length === 0 &&
         newPlan.toPushNotes.length === 0 &&
+        newPlan.toTrashNotes.length === 0 &&
         newPlan.toDelete.length === 0
       ) {
         parts.push('Everything is already in sync.');
@@ -406,6 +433,7 @@ export const ZoteroSync = () => {
     const toMatch = plan.toMatch.filter((e) => selected.has(e.id));
     const toPushTags = plan.toPushTags.filter((e) => selected.has(e.id));
     const toPushNotes = plan.toPushNotes.filter((e) => selected.has(e.id));
+    const toTrashNotes = plan.toTrashNotes.filter((e) => selected.has(e.id));
     const toFoldDuplicates = plan.toFoldDuplicates.filter((d) => selected.has(d.id));
     const total =
       toFoldDuplicates.length +
@@ -414,6 +442,7 @@ export const ZoteroSync = () => {
       toMatch.length +
       toPushTags.length +
       toPushNotes.length +
+      toTrashNotes.length +
       toDelete.length;
     if (total === 0) return;
 
@@ -428,12 +457,12 @@ export const ZoteroSync = () => {
     setHasLog(true);
     log.log(
       'run',
-      `Apply changes clicked — ${toCreate.length} create(s), ${toUpdate.length} update(s), ${toMatch.length} adoption(s), ${toFoldDuplicates.length} fold(s), ${toPushTags.length} push(es), ${toPushNotes.length} note push(es), ${toDelete.length} delete(s).`
+      `Apply changes clicked — ${toCreate.length} create(s), ${toUpdate.length} update(s), ${toMatch.length} adoption(s), ${toFoldDuplicates.length} fold(s), ${toPushTags.length} push(es), ${toPushNotes.length} note push(es), ${toTrashNotes.length} note(s) to trash, ${toDelete.length} delete(s).`
     );
     try {
-      const { folded, created, updated, matched, pushed, notesPushed, deleted } = await applySyncPlan(
+      const { folded, created, updated, matched, pushed, notesPushed, notesTrashed, deleted } = await applySyncPlan(
         plugin,
-        { toFoldDuplicates, toCreate, toUpdate, toMatch, toPushTags, toPushNotes, toDelete },
+        { toFoldDuplicates, toCreate, toUpdate, toMatch, toPushTags, toPushNotes, toTrashNotes, toDelete },
         ctx,
         {
           onItemDone: (id, ok) => {
@@ -445,15 +474,15 @@ export const ZoteroSync = () => {
         log
       );
       setApplied(true);
-      const okCount = folded + created + updated + matched + pushed + notesPushed + deleted;
+      const okCount = folded + created + updated + matched + pushed + notesPushed + notesTrashed + deleted;
       const failCount = total - okCount;
       setStatus(
         `Done. Folded ${folded}, created ${created}, updated ${updated}, matched ${matched}, pushed ${pushed}, ` +
-          `${notesPushed} note(s) pushed, deleted ${deleted}.`
+          `${notesPushed} note(s) pushed, ${notesTrashed} note(s) trashed, deleted ${deleted}.`
       );
       await plugin.app.toast(
         `Zotero sync applied — ${created} created, ${updated} updated, ${matched} matched, ` +
-          `${pushed} pushed, ${notesPushed} notes, ${folded} folded, ${deleted} deleted${failCount > 0 ? `, ${failCount} failed` : ''}.`
+          `${pushed} pushed, ${notesPushed} notes, ${notesTrashed} trashed, ${folded} folded, ${deleted} deleted${failCount > 0 ? `, ${failCount} failed` : ''}.`
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -484,6 +513,7 @@ export const ZoteroSync = () => {
       plan.toMatch.filter((e) => selected.has(e.id)).length +
       plan.toPushTags.filter((e) => selected.has(e.id)).length +
       plan.toPushNotes.filter((e) => selected.has(e.id)).length +
+      plan.toTrashNotes.filter((e) => selected.has(e.id)).length +
       plan.toFoldDuplicates.filter((d) => selected.has(d.id)).length +
       plan.toUpdate.filter((e) => e.changes.some((c) => selected.has(`${e.id}:${c.field}`))).length
     : 0;

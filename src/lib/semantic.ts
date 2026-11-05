@@ -22,6 +22,7 @@
  * best-effort.
  */
 import type { RNPlugin } from '@remnote/plugin-sdk';
+import { numberReferences } from './citations';
 import { HIERARCHY, SLOTS, ZOTERO_ITEM_POWERUP } from './consts';
 import { safeRichTextToString } from './notes';
 
@@ -199,63 +200,68 @@ function sanitizeTitle(s: string): string {
 
 // ───────────────────────── Per-source fetchers (each catches → []) ─────────────────────────
 
-/** Crossref references (DOIs + partial metadata). Crossref has no citing list. */
-async function crossrefRefs(doi: string): Promise<RawPaper[]> {
+/** One entry of a Crossref work's `reference` array (only the fields we read). */
+interface CrossrefRef {
+  key?: string;
+  DOI?: string;
+  'article-title'?: string;
+  'volume-title'?: string;
+  'journal-title'?: string;
+  unstructured?: string;
+  year?: string;
+  author?: string;
+}
+
+/** A work's raw Crossref reference array, in Crossref's own (often scrambled) order; [] on failure. */
+async function crossrefRawRefs(doi: string): Promise<CrossrefRef[]> {
   try {
     const res = await fetch(`https://api.crossref.org/works/${encodeDoiPath(doi)}`, {
       headers: { Accept: 'application/json' },
     });
     if (!res.ok) return [];
-    const j = (await res.json()) as {
-      message?: {
-        reference?: {
-          key?: string;
-          DOI?: string;
-          'article-title'?: string;
-          'volume-title'?: string;
-          'journal-title'?: string;
-          unstructured?: string;
-          year?: string;
-          author?: string;
-        }[];
-      };
-    };
-    const raw = j.message?.reference ?? [];
-    // Crossref returns the reference array in an arbitrary (often scrambled) order, NOT the order
-    // the references appear in the paper. The real in-document ordinal lives in each entry's `key`
-    // (e.g. "ref1".."ref37", "BIB12", "10.1109/x-ref-001" → 1). Recover document order by sorting on
-    // the LAST digit-group of the key (the ordinal usually trails any DOI/prefix). Only reorder when
-    // EVERY reference yields a unique ordinal — otherwise the keys aren't plain ordinals (e.g.
-    // author-year keys), so keep Crossref's array order. (mergeUnique stamps `order` from this
-    // insertion sequence, which drives the menu's "Default" sort.)
-    const ordinalOf = (key?: string): number | null => {
-      const groups = (key ?? '').match(/\d+/g);
-      return groups && groups.length ? Number(groups[groups.length - 1]) : null;
-    };
-    const ordinals = raw.map((r) => ordinalOf(r.key));
-    const ordered =
-      ordinals.every((n) => n !== null) && new Set(ordinals).size === ordinals.length
-        ? raw
-            .map((r, i) => ({ r, n: ordinals[i] as number }))
-            .sort((a, b) => a.n - b.n)
-            .map((x) => x.r)
-        : raw;
-    return ordered.map((r) => ({
-      doi: normalizeDoi(r.DOI),
-      // Real title only. `unstructured` (a raw citation string) is NOT a title — keep it as a fallback
-      // so enrichMissing still fetches the real title by DOI (Crossref refs often have only unstructured).
-      title: (r['article-title'] || r['volume-title'] || '').toString().trim(),
-      fallbackTitle: (r.unstructured || '').toString().trim() || undefined,
-      authors: (r.author ?? '').toString().trim(),
-      year: (r.year ?? '').toString().trim(),
-      sourceUrl: '', // Crossref has no per-item public page → merge falls back to doi.org.
-      citationCount: 0, // not in the reference array.
-      venue: (r['journal-title'] ?? '').toString().trim(),
-      abstract: '',
-    }));
+    const j = (await res.json()) as { message?: { reference?: CrossrefRef[] } };
+    return j.message?.reference ?? [];
   } catch {
     return [];
   }
+}
+
+const crossrefToRaw = (r: CrossrefRef): RawPaper => ({
+  doi: normalizeDoi(r.DOI),
+  // Real title only. `unstructured` (a raw citation string) is NOT a title — keep it as a fallback
+  // so enrichMissing still fetches the real title by DOI (Crossref refs often have only unstructured).
+  title: (r['article-title'] || r['volume-title'] || '').toString().trim(),
+  fallbackTitle: (r.unstructured || '').toString().trim() || undefined,
+  authors: (r.author ?? '').toString().trim(),
+  year: (r.year ?? '').toString().trim(),
+  sourceUrl: '', // Crossref has no per-item public page → merge falls back to doi.org.
+  citationCount: 0, // not in the reference array.
+  venue: (r['journal-title'] ?? '').toString().trim(),
+  abstract: '',
+});
+
+/**
+ * Crossref's reference array with each entry's citation number, sorted into the paper's own order.
+ * Crossref returns the array in an arbitrary (often scrambled) order; the in-document number lives in
+ * each entry's deposit `key`, which publishers write differently — `numberReferences` reads them all
+ * (2026-11-05; it replaced a last-digit-group rule that left APS, RSC, ACS and Wiley lists unsorted).
+ * `numbered` is false when the keys carry no numbering (author-year keys): Crossref's order is kept.
+ */
+async function crossrefNumberedRefs(
+  doi: string
+): Promise<{ entries: { ref: CrossrefRef; n: number; part: number }[]; numbered: boolean }> {
+  const raw = await crossrefRawRefs(doi);
+  const numbers = numberReferences(raw.map((r) => r.key));
+  const entries = raw.map((ref, i) => ({ ref, n: numbers?.[i].n ?? 0, part: numbers?.[i].part ?? 0, i }));
+  if (numbers) entries.sort((a, b) => a.n - b.n || a.part - b.part || a.i - b.i);
+  return { entries, numbered: !!numbers };
+}
+
+/** Crossref references (DOIs + partial metadata), in the paper's order. Crossref has no citing list.
+ *  (mergeUnique stamps `order` from this insertion sequence, which drives the menu's "Default" sort.) */
+async function crossrefRefs(doi: string): Promise<RawPaper[]> {
+  const { entries } = await crossrefNumberedRefs(doi);
+  return entries.map((e) => crossrefToRaw(e.ref));
 }
 
 /** Semantic Scholar Graph API references OR citations list (resolved-DOI works). */
@@ -1144,6 +1150,103 @@ export async function fetchAllSources(doi: string, plugin: RNPlugin): Promise<Mu
   };
   cache.set(key, result);
   return result;
+}
+
+// ───────────────────────── Numbered reference list (Convert Inline Citations) ─────────────────────────
+
+/** One entry of a paper's reference list, with its citation number. */
+export interface NumberedRef {
+  /** The citation number in the paper ("[n]"); 0 when the list carries no numbering. */
+  n: number;
+  /** This work's order among several under one number ("[5] (a) …; (b) …"). */
+  part: number;
+  /** "5" — or "5a", "5b" when several works share a number; '' when the list is unnumbered. */
+  label: string;
+  paper: RelatedPaper;
+}
+
+/** A paper's reference list for matching "[n]" citations. */
+export interface NumberedRefList {
+  refs: NumberedRef[];
+  /** True when the numbers come from Crossref's deposit keys; false → each reference is picked by hand. */
+  numbered: boolean;
+  /** Crossref, the unnumbered Semantic Scholar/OpenAlex/OpenCitations union, or nothing found. */
+  source: 'Crossref' | 'other' | 'none';
+}
+
+/** One raw work as a RelatedPaper, without merging — a numbered list keeps every entry. */
+function toRelatedPaper(p: RawPaper, source: SourceName, order: number, index: Map<string, LibDoc>): RelatedPaper {
+  const doi = normalizeDoi(p.doi);
+  const link = p.sourceUrl || (doi ? `https://doi.org/${doi}` : '');
+  const lib = doi ? index.get(doi) : undefined;
+  return {
+    doi,
+    title: sanitizeTitle(p.title),
+    fallbackTitle: p.fallbackTitle ? sanitizeTitle(p.fallbackTitle) : undefined,
+    authors: p.authors,
+    year: p.year,
+    url: link,
+    sources: [source],
+    sourceLinks: link ? [{ name: source, url: link }] : [],
+    citationCount: p.citationCount,
+    venue: p.venue,
+    abstract: p.abstract,
+    order,
+    inLibrary: !!lib,
+    remId: lib?.remId ?? '',
+  };
+}
+
+/**
+ * A paper's reference list with citation numbers, for "Remzot: Convert Inline Citations". Crossref is
+ * the only source that numbers references (through its deposit keys — see `numberReferences`). When
+ * Crossref has no list, the Semantic Scholar + OpenAlex + OpenCitations union comes back UNNUMBERED,
+ * sorted by title, so each reference can still be picked by hand. Titles are backfilled by DOI
+ * (`enrichMissing`); `index` (DOI → library doc) flags entries already in Zotero/Items. Never throws.
+ */
+export async function fetchNumberedReferences(
+  doi: string,
+  index: Map<string, LibDoc> = new Map()
+): Promise<NumberedRefList> {
+  const key = normalizeDoi(doi);
+  if (!key) return { refs: [], numbered: false, source: 'none' };
+
+  const { entries, numbered } = await crossrefNumberedRefs(key);
+  if (entries.length) {
+    const papers = entries.map((e, i) => toRelatedPaper(crossrefToRaw(e.ref), 'Crossref', i, index));
+    await enrichMissing(papers);
+    const perNumber = new Map<number, number>();
+    for (const e of entries) perNumber.set(e.n, (perNumber.get(e.n) ?? 0) + 1);
+    const seen = new Map<number, number>();
+    const refs = entries.map((e, i): NumberedRef => {
+      const k = seen.get(e.n) ?? 0;
+      seen.set(e.n, k + 1);
+      const shared = (perNumber.get(e.n) ?? 0) > 1;
+      const label = !numbered ? '' : shared ? `${e.n}${String.fromCharCode(97 + Math.min(k, 25))}` : String(e.n);
+      return { n: numbered ? e.n : 0, part: e.part, label, paper: papers[i] };
+    });
+    return { refs, numbered, source: 'Crossref' };
+  }
+
+  const [s2Refs, oaRefs, ocRefs] = await Promise.all([
+    s2List(key, 'references'),
+    openAlexReferences(key),
+    openCitationsList(key, 'references'),
+  ]);
+  const merged = mergeUnique(
+    [
+      { source: 'Semantic', papers: s2Refs },
+      { source: 'OpenAlex', papers: oaRefs },
+      { source: 'OpenCitations', papers: ocRefs },
+    ],
+    index,
+    key
+  );
+  if (!merged.length) return { refs: [], numbered: false, source: 'none' };
+  await enrichMissing(merged);
+  const name = (p: RelatedPaper): string => p.title || p.fallbackTitle || p.doi;
+  merged.sort((a, b) => name(a).localeCompare(name(b)));
+  return { refs: merged.map((paper) => ({ n: 0, part: 0, label: '', paper })), numbered: false, source: 'other' };
 }
 
 /** The deduped in-library subset of (references ∪ citations) — a work can be BOTH a reference and a

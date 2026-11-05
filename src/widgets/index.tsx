@@ -8,7 +8,9 @@ import {
 } from '@remnote/plugin-sdk';
 import '../style.css';
 import '../index.css';
+import { openConvertCitations, trackEditorFocus } from '../lib/citeConvert';
 import {
+  CONVERT_WIDGET,
   ITEM_MENU_WIDGET,
   SESSION,
   SETTINGS,
@@ -133,12 +135,28 @@ async function onActivate(plugin: ReactRNPlugin) {
     }
   });
 
+  // Every command carries the "Remzot:" prefix so they are easy to find in the omnibar (mo, 2026-11-05).
   await plugin.app.registerCommand({
     id: 'open-zotero-sync',
-    name: 'Open Zotero Sync',
+    name: 'Remzot: Open Zotero Sync',
     quickCode: 'zot',
     action: async () => {
       await plugin.widget.openPopup(SYNC_WIDGET);
+    },
+  });
+
+  // --- Convert Inline Citations: a paper's "[n]" citations → \cite{citekeys} (see lib/citeConvert.ts) ---
+  await plugin.app.registerWidget(CONVERT_WIDGET, WidgetLocation.Popup, {
+    dimensions: { height: 800, width: 1000 },
+  });
+  // Run from the Omnibar, the command finds the caret and selection already gone — keep the last ones.
+  trackEditorFocus(plugin);
+  await plugin.app.registerCommand({
+    id: 'convert-inline-citations',
+    name: 'Remzot: Convert Inline Citations',
+    quickCode: 'zcite',
+    action: async () => {
+      await openConvertCitations(plugin);
     },
   });
 }
