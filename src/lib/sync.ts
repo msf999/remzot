@@ -54,6 +54,19 @@ const LOG_LIST_CAP = 200;
 /** Cap on how many to-delete children get the (more expensive) per-rem diagnostic line. */
 const DELETE_DIAG_CAP = 50;
 
+/**
+ * Notes guard (R-034). RemNote intermittently answers NOTHING when a linked rem is looked up by id
+ * (2026-11-05: ~700 notes looked changed in two previews, 37 in the run between). A run that holds
+ * back at least NOTES_HELD_SUSPECT notes, or would rewrite at least MASS_NOTE_REWRITE_MIN existing
+ * Zotero notes AND MASS_NOTE_REWRITE_SHARE of them, is flagged so the popup leaves its note pushes
+ * unticked.
+ */
+const NOTES_HELD_SUSPECT = 20;
+const MASS_NOTE_REWRITE_MIN = 50;
+const MASS_NOTE_REWRITE_SHARE = 0.2;
+/** Cap on individually-logged held-back notes (a bad run holds back hundreds). */
+const HELD_LOG_CAP = 20;
+
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /** A Zotero item that will be created as a Remnote document. */
@@ -177,6 +190,9 @@ export interface NotePushEntry {
   lineCount: number;
 }
 
+/** A built note plus the body links whose target could not be read (see `buildNoteForDoc`). */
+export type NoteBuild = BuiltNote & { unresolved: number; unresolvedIds: string[] };
+
 /** The full set of changes a sync would make. */
 export interface SyncPlan {
   /** Same-name duplicate lookup rems to fold into the oldest copy (opt-out rows, ids `ld:<remId>`). */
@@ -205,6 +221,13 @@ export interface SyncPlan {
    * truncated/throttled fetch can't falsely wipe real docs. (no-key / duplicate-key deletes still run.)
    */
   partialFetchSkippedDeletes: boolean;
+  /**
+   * Docs whose note WOULD change but could not be read completely — a linked rem came back empty —
+   * so no note was staged for them this run (R-034).
+   */
+  notesHeldBack: number;
+  /** True when this run's note pushes look untrustworthy (many held back, or a mass rewrite) — unticked by default. */
+  notesSuspect: boolean;
 }
 
 /**
@@ -892,21 +915,22 @@ async function storedVersion(rem: PluginRem): Promise<number> {
 }
 
 /**
- * Resolve a reference rem id to its name (cached per run). A target that can't be read resolves to
- * '' like a missing one: it costs its name, never the note that links to it (R-032).
+ * A reference's name, or `null` when its target can't be found right now. Found names are cached per
+ * run; misses are not, so a later lookup can still succeed. A failing `findOne` throws through.
  */
-async function resolveRefName(plugin: RNPlugin, ctx: SyncContext, id: string): Promise<string> {
+async function readRefName(plugin: RNPlugin, ctx: SyncContext, id: string): Promise<string | null> {
   const cached = ctx.refNameCache.get(id);
   if (cached !== undefined) return cached;
-  let name = '';
-  try {
-    const r = await plugin.rem.findOne(id);
-    name = r ? await remName(plugin, r) : '';
-  } catch {
-    /* unreadable target — keep '' */
-  }
+  const r = await plugin.rem.findOne(id);
+  if (!r) return null;
+  const name = await remName(plugin, r);
   ctx.refNameCache.set(id, name);
   return name;
+}
+
+/** Resolve a reference rem id to its name; a missing target reads as '' (that is how dangling refs show). */
+async function resolveRefName(plugin: RNPlugin, ctx: SyncContext, id: string): Promise<string> {
+  return (await readRefName(plugin, ctx, id)) ?? '';
 }
 
 /** Read a slot as RichText, preserving reference elements (undefined if unset/error). */
@@ -1409,8 +1433,12 @@ export async function removeRemDeep(
  * heading level / todo state / sub-document detection at ~3 calls per rem, so it is only paid for
  * items actually being pushed — with `hashOverride` carrying the cheap hash forward so the marker
  * stays comparable run to run.
+ *
+ * `unresolved` counts body links whose target could not be read (findOne found nothing or threw).
+ * Their lines are missing from this build, so a caller must never PUSH a note with `unresolved > 0`
+ * (R-034). Exported for the dev test hook.
  */
-async function buildNoteForDoc(
+export async function buildNoteForDoc(
   plugin: RNPlugin,
   ctx: SyncContext,
   doc: PluginRem,
@@ -1418,8 +1446,18 @@ async function buildNoteForDoc(
   rich: boolean,
   hashOverride?: string,
   abstract?: string
-): Promise<BuiltNote | null> {
-  const ref = (id: string) => resolveRefName(plugin, ctx, id);
+): Promise<NoteBuild | null> {
+  const unresolved = new Set<string>();
+  const ref = async (id: string): Promise<string> => {
+    let found: string | null = null;
+    try {
+      found = await readRefName(plugin, ctx, id);
+    } catch {
+      found = null;
+    }
+    if (found === null) unresolved.add(id);
+    return found ?? '';
+  };
   const lines = await collectBody(plugin, doc, ref, rich);
   if (!lines.length) return null;
   // ABSTRACT-ONLY body → nothing to push (mo, 2026-09-05). The abstract is the one bullet Remzot itself
@@ -1455,7 +1493,7 @@ async function buildNoteForDoc(
     lines,
     referencedBy,
   };
-  return buildNote(src, hashOverride);
+  return { ...buildNote(src, hashOverride), unresolved: unresolved.size, unresolvedIds: [...unresolved] };
 }
 
 export async function computeSyncPlan(
@@ -1492,6 +1530,7 @@ export async function computeSyncPlan(
   const toPushNotes: NotePushEntry[] = [];
   const alreadyPresent: KeptEntry[] = [];
   let skippedInternal = 0;
+  let notesHeldBack = 0;
   let listed = 0;
   let diagged = 0;
 
@@ -1643,8 +1682,22 @@ export async function computeSyncPlan(
             const existing = ctx.notesByParent.get(key);
             const storedHash = existing ? extractNoteHash(existing.note) : null;
             if (storedHash !== probe.hash) {
-              const built = (await buildNoteForDoc(plugin, ctx, child, name, true, probe.hash, item.data.abstractNote)) ?? probe;
-              if (built.tooLong) {
+              const built = probe.unresolved
+                ? probe
+                : (await buildNoteForDoc(plugin, ctx, child, name, true, probe.hash, item.data.abstractNote)) ?? probe;
+              if (built.unresolved) {
+                // A linked rem came back empty, so the "difference" may be nothing but its missing
+                // lines — never stage a note read like that (R-034). A link to a DELETED rem keeps
+                // the note held back until the link is removed, hence the ids in the log.
+                notesHeldBack += 1;
+                if (notesHeldBack <= HELD_LOG_CAP)
+                  log?.log(
+                    'plan',
+                    `  NOTE   "${shown}" held back — ${built.unresolved} linked rem(s) could not be read (${built.unresolvedIds
+                      .slice(0, 3)
+                      .join(', ')}${built.unresolved > 3 ? ', …' : ''}).`
+                  );
+              } else if (built.tooLong) {
                 log?.log(
                   'plan',
                   `  NOTE   "${shown}" SKIPPED — ${built.html.length} chars exceeds Zotero's 500,000-char note limit.`
@@ -1776,9 +1829,31 @@ export async function computeSyncPlan(
     ? toDelete.filter((d) => d.reason !== 'missing-from-zotero')
     : toDelete;
 
+  // NOTES GUARD (R-034): held-back notes were never staged, but a run that held back many — or that
+  // would rewrite a large share of the existing Zotero notes at once — is a sign RemNote was not
+  // answering lookups, so even the notes it did build are left for the user to tick.
+  const existingNotes = ctx.notesByParent?.size ?? 0;
+  const noteRewrites = toPushNotes.filter((n) => n.noteKey).length;
+  const massNoteRewrite =
+    noteRewrites >= MASS_NOTE_REWRITE_MIN && noteRewrites >= existingNotes * MASS_NOTE_REWRITE_SHARE;
+  const notesSuspect = notesHeldBack >= NOTES_HELD_SUSPECT || massNoteRewrite;
+  if (notesHeldBack > HELD_LOG_CAP)
+    log?.log('plan', `  … (${notesHeldBack - HELD_LOG_CAP} more held-back notes not individually listed)`);
+  if (notesSuspect) {
+    log?.log(
+      'plan',
+      `SAFETY GUARD: ${notesHeldBack} note(s) held back (linked rems could not be read) and ${noteRewrites} of ${existingNotes} existing Zotero notes would be rewritten — note pushes look unreliable this run and are left unticked. Wait a minute and run Get from Zotero again.`
+    );
+  } else if (notesHeldBack) {
+    log?.log(
+      'plan',
+      `${notesHeldBack} note(s) held back — a linked rem could not be read (RemNote still loading, or a link to a deleted rem).`
+    );
+  }
+
   log?.log(
     'plan',
-    `Plan summary → create=${toCreate.length}, update=${toUpdate.length}, match=${toMatch.length}, push=${toPushTags.length}, delete=${finalDelete.length}, skippedInternal=${skippedInternal}, emptyLibrarySkippedDeletes=${emptyLibrarySkippedDeletes}, partialFetchSkippedDeletes=${partialFetchSkippedDeletes}.`
+    `Plan summary → create=${toCreate.length}, update=${toUpdate.length}, match=${toMatch.length}, push=${toPushTags.length}, notes=${toPushNotes.length}, notesHeldBack=${notesHeldBack}, delete=${finalDelete.length}, skippedInternal=${skippedInternal}, emptyLibrarySkippedDeletes=${emptyLibrarySkippedDeletes}, partialFetchSkippedDeletes=${partialFetchSkippedDeletes}, notesSuspect=${notesSuspect}.`
   );
 
   return {
@@ -1794,6 +1869,8 @@ export async function computeSyncPlan(
     alreadyPresent,
     emptyLibrarySkippedDeletes,
     partialFetchSkippedDeletes,
+    notesHeldBack,
+    notesSuspect,
   };
 }
 
@@ -2425,13 +2502,18 @@ export async function syncSingleItem(
   // escape hatch for the bulk path's one blind spot (a formatting-only edit, e.g. ticking a todo,
   // changes no text and so does not move the cheap hash). One item = one extra request.
   let notesPushed = false;
+  let notesHeld = 0;
   try {
     // Hash from the CHEAP pass so the marker stays comparable with computeSyncPlan's probe —
     // otherwise the per-item Sync stamps a rich-pass hash the bulk detector can never match, and
     // the item re-stages on every subsequent preview.
     const probe = await buildNoteForDoc(plugin, ctx, rem, wantName, false, undefined, item.data.abstractNote);
     const built = await buildNoteForDoc(plugin, ctx, rem, wantName, true, probe?.hash, item.data.abstractNote);
-    if (built && !built.empty) {
+    notesHeld = Math.max(probe?.unresolved ?? 0, built?.unresolved ?? 0);
+    if (notesHeld) {
+      // Unconditional push or not, never overwrite the Zotero note with a read that lost lines (R-034).
+      log?.log('apply', `  notes held back — ${notesHeld} linked rem(s) could not be read.`);
+    } else if (built && !built.empty) {
       if (built.tooLong) {
         log?.log('apply', `  notes skipped — ${built.html.length} chars exceeds Zotero's limit.`);
       } else {
@@ -2458,6 +2540,10 @@ export async function syncSingleItem(
   if (pulled.length) parts.push(`refreshed ${pulled.join(', ')}`);
   if (pushed) parts.push(`pushed ${pushed.length} tag${pushed.length === 1 ? '' : 's'} to Zotero`);
   if (notesPushed) parts.push('pushed notes to Zotero');
+  if (notesHeld)
+    parts.push(
+      `held back the notes (${notesHeld} linked rem${notesHeld === 1 ? '' : 's'} could not be read — try again in a minute)`
+    );
   const message = parts.length
     ? `Synced "${wantName}" — ${parts.join(', ')}.`
     : `"${wantName}" is already up to date.`;

@@ -324,7 +324,9 @@ export const ZoteroSync = () => {
         ...newPlan.toUpdate.flatMap((e) => e.changes.map((c) => `${e.id}:${c.field}`)),
         ...newPlan.toMatch.map((e) => e.id),
         ...newPlan.toPushTags.map((e) => e.id),
-        ...newPlan.toPushNotes.map((e) => e.id),
+        // A suspicious run's note pushes start unticked (R-034): applying them could overwrite
+        // hundreds of Zotero notes with versions missing lines.
+        ...(newPlan.notesSuspect ? [] : newPlan.toPushNotes.map((e) => e.id)),
       ];
       setSelected(new Set(allIds));
       setPlan(newPlan);
@@ -350,6 +352,15 @@ export const ZoteroSync = () => {
       if (newPlan.partialFetchSkippedDeletes) {
         parts.push(
           `Fetched ${items.length} item(s) but Zotero reports ${reportedTotal || 'more'} — the fetch looks incomplete, so deletions of "missing" items were suppressed. Re-run once the full library loads.`
+        );
+      }
+      if (newPlan.notesSuspect) {
+        parts.push(
+          `Note pushes look unreliable this run: ${newPlan.notesHeldBack} note(s) were held back because RemNote returned nothing for their linked rems, and ${newPlan.toPushNotes.length} would be pushed — so they are left unticked. Wait a minute and click Get from Zotero again; tick them only if you expected this many.`
+        );
+      } else if (newPlan.notesHeldBack) {
+        parts.push(
+          `${newPlan.notesHeldBack} note(s) held back — they link to rems RemNote couldn't read (still loading, or deleted); the Log lists them.`
         );
       }
       // ALL SEVEN categories, or the line contradicts itself: gated on only five of them, a preview
