@@ -39,18 +39,23 @@ import {
   type ZoteroItem,
 } from './zoteroApi';
 import {
+  type AliasResolver,
   type BuiltNote,
   buildNote,
   collectBody,
   extractNoteHash,
   hashNoteSource,
   isSearchPortal,
+  type NoteLine,
   type NoteSource,
   remnoteDeepLink,
   renderMarkdown,
   safeRichTextToString,
 } from './notes';
 import type { SyncLog } from './log';
+
+/** RemNote's Link powerup (`BuiltInPowerupCodes.Link`): an inline web link names a rem carrying it, with the address in its URL slot. */
+const LINK_POWERUP = 'b';
 
 /** Cap on how many individual rows each per-item enumeration writes to the log. */
 const LOG_LIST_CAP = 200;
@@ -193,18 +198,20 @@ export interface NotePushEntry {
   /** Number of body lines, for the preview row. */
   lineCount: number;
   /**
-   * The only difference from the stored note is that RemNote's hidden References portal no longer
-   * goes into it (R-031): a one-time rewrite, which the mass-rewrite guard does not count.
+   * The stored note holds the same text, written in an older format — before RemNote's hidden
+   * References portal was left out (R-031), or before notes followed how RemNote draws the doc
+   * (aliases, pins, clozes, flashcards; 2026-11-06). A one-time rewrite, which the mass-rewrite guard
+   * does not count.
    */
-  portalCleanup?: boolean;
+  formatOnly?: boolean;
 }
 
 /**
  * A built note plus the body links whose target could not be read (see `buildNoteForDoc`), and
- * `legacyHash` — the hash the note had before hidden References portals were skipped (equal to
- * `hash` when the doc has none). Meaningful on the cheap pass, the one whose hash is compared.
+ * `legacyHashes` — the hashes the same content had in the formats Remzot wrote before, newest first,
+ * leaving out `hash` itself. Meaningful on the cheap pass, the one whose hash is compared.
  */
-export type NoteBuild = BuiltNote & { unresolved: number; unresolvedIds: string[]; legacyHash: string };
+export type NoteBuild = BuiltNote & { unresolved: number; unresolvedIds: string[]; legacyHashes: string[] };
 
 /** Why a doc has no note to push: no body of the user's, or only the abstract Remzot wrote. */
 export type NoNoteReason = 'empty' | 'abstract-only';
@@ -1480,8 +1487,8 @@ export async function removeRemDeep(
  * (R-034). Exported for the dev test hook.
  *
  * RemNote's hidden References portal is left out of the note and of "Referenced by" (R-031), but
- * still read, so `legacyHash` can tell a stored note that differs ONLY by it. `why`, when passed,
- * says why null came back: nothing of the user's in the body, or only the abstract.
+ * still read, so `legacyHashes` can tell a stored note that differs from this one only in format.
+ * `why`, when passed, says why null came back: nothing of the user's in the body, or only the abstract.
  */
 export async function buildNoteForDoc(
   plugin: RNPlugin,
@@ -1508,8 +1515,54 @@ export async function buildNoteForDoc(
   };
   // A link inside the hidden portal is never pushed, so an unreadable one must not hold a note back.
   const refHidden = async (id: string): Promise<string> => (await lookup(id)) ?? '';
-  const all = await collectBody(plugin, doc, ref, rich, refHidden);
-  const lines = all.filter((l) => !l.hidden);
+  // An aliased reference shows its alias in RemNote ("Abstract" for a highlight that reads "The
+  // inconclusiv"). The alias rem itself can't be fetched — `findOne` answers nothing for it and
+  // `getAliases` hands back no ids — but RemNote's own rendering of the reference names it: one call per
+  // distinct alias, cached. If that comes back empty the target's own name stands in, counted as usual.
+  const alias: AliasResolver = async (el, fallback) => {
+    const key = `alias~${el._id}~${el.aliasId}`;
+    const cached = ctx.refNameCache.get(key);
+    if (cached !== undefined) return cached;
+    let shown = '';
+    try {
+      shown = (await plugin.richText.toString([{ i: 'q', _id: el._id, aliasId: el.aliasId } as any])).trim();
+    } catch {
+      shown = '';
+    }
+    if (!shown) return fallback(el._id);
+    ctx.refNameCache.set(key, shown);
+    return shown;
+  };
+  const remLink = ctx.kbId
+    ? (id: string, label?: string) => remnoteDeepLink(ctx.kbId as string, id, label ?? '')
+    : undefined;
+  // Rich pass only: the address behind an inline link (the Link rem's URL property), and the highlight
+  // colour of what a reference points at. Both cached per run; a failed read just loses the link or colour.
+  const cachedRead = async (key: string, read: () => Promise<string | undefined>): Promise<string | undefined> => {
+    const cached = ctx.refNameCache.get(key);
+    if (cached !== undefined) return cached || undefined;
+    let v = '';
+    try {
+      v = ((await read()) ?? '').trim();
+    } catch {
+      v = '';
+    }
+    ctx.refNameCache.set(key, v);
+    return v || undefined;
+  };
+  const linkUrl = (id: string) =>
+    cachedRead(`url~${id}`, async () => {
+      const r = await plugin.rem.findOne(id);
+      return r && (await r.hasPowerup(LINK_POWERUP)) ? await r.getPowerupProperty(LINK_POWERUP, 'URL') : undefined;
+    });
+  const refHighlight = (id: string) =>
+    cachedRead(`hl~${id}`, async () => (await (await plugin.rem.findOne(id))?.getHighlightColor()) ?? undefined);
+  const all = await collectBody(plugin, doc, ref, rich, refHidden, {
+    alias,
+    remLink,
+    ...(rich ? { linkUrl, refHighlight } : {}),
+  });
+  const lines = all.filter((l) => !l.hidden && (l.text || l.kind !== 'bullet'));
   if (!lines.length) {
     if (why) why.reason = 'empty';
     return null;
@@ -1530,7 +1583,7 @@ export async function buildNoteForDoc(
   // hashed — an unstable order would re-push the note on every machine that returns a different
   // one. Every other order-sensitive comparison in this file is normalized the same way.
   // The doc's own hidden References portal "references" it only because its search names the doc,
-  // so it is left out — but kept aside for `legacyHash`.
+  // so it is left out — but kept aside for `legacyHashes`.
   const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name);
   const referencedBy: { name: string; url?: string }[] = [];
   const hiddenBacklinks: { name: string; url?: string }[] = [];
@@ -1558,15 +1611,22 @@ export async function buildNoteForDoc(
     referencedBy,
   };
   const built = buildNote(src, hashOverride);
-  // The hash this note had before hidden portals were skipped — every line and backlink, hashed
-  // exactly as Remzot used to — so a caller can tell a portal-only difference from a real edit.
-  const legacyHash =
-    all.length === lines.length && hiddenBacklinks.length === 0
-      ? built.hash
-      : hashNoteSource(
-          renderMarkdown({ ...src, lines: all, referencedBy: [...referencedBy, ...hiddenBacklinks].sort(byName) }, true)
-        );
-  return { ...built, unresolved: unresolved.size, unresolvedIds: [...unresolved], legacyHash };
+  // The hashes the same content had in the formats Remzot wrote before, so a caller can tell a note
+  // that only needs re-rendering from one whose text changed. Newest first:
+  //  · v0.3.0 (2026-11-05/06) — no hidden portal; every reference as its target's name (pins and
+  //    aliases too), no cloze marks, no flashcard backs;
+  //  · up to v0.2.7 — the same, plus the hidden References portal's lines and its backlink.
+  const asLegacy = (l: NoteLine): NoteLine => ({ ...l, text: l.legacyText ?? l.text });
+  const keptLegacy = (l: NoteLine) => !!(l.legacyText ?? l.text) || l.kind !== 'bullet';
+  const v030 = all.filter((l) => !l.hidden && keptLegacy(l)).map(asLegacy);
+  const v027 = all.filter(keptLegacy).map(asLegacy);
+  const legacyHashes = [
+    hashNoteSource(renderMarkdown({ ...src, lines: v030 }, true)),
+    hashNoteSource(
+      renderMarkdown({ ...src, lines: v027, referencedBy: [...referencedBy, ...hiddenBacklinks].sort(byName) }, true)
+    ),
+  ].filter((h, i, a) => h !== built.hash && a.indexOf(h) === i);
+  return { ...built, unresolved: unresolved.size, unresolvedIds: [...unresolved], legacyHashes };
 }
 
 /**
@@ -1819,9 +1879,10 @@ export async function computeSyncPlan(
           } else if (!probe.empty) {
             const storedHash = existing ? extractNoteHash(existing.note) : null;
             if (storedHash !== probe.hash) {
-              // Matching the hash from before hidden portals were skipped means the portal's lines are
-              // the ONLY difference: a one-time rewrite, not a sign of trouble (R-031).
-              const portalCleanup = !!storedHash && storedHash === probe.legacyHash;
+              // Matching a hash this content had in an older format means the text is unchanged and only
+              // the rendering moved on (R-031's portal, the 2026-11-06 fidelity work): a one-time rewrite,
+              // not a sign of trouble.
+              const formatOnly = !!storedHash && probe.legacyHashes.includes(storedHash);
               const built = probe.unresolved
                 ? probe
                 : (await buildNoteForDoc(plugin, ctx, child, name, true, probe.hash, item.data.abstractNote)) ?? probe;
@@ -1853,13 +1914,13 @@ export async function computeSyncPlan(
                   html: built.html,
                   hash: probe.hash,
                   lineCount: built.lineCount,
-                  ...(portalCleanup ? { portalCleanup: true } : {}),
+                  ...(formatOnly ? { formatOnly: true } : {}),
                 });
                 if (listed < LOG_LIST_CAP)
                   log?.log(
                     'plan',
                     `  NOTE   "${shown}" — ${
-                      portalCleanup ? 'update note, dropping the hidden References portal' : existing ? 'update note' : 'create note'
+                      formatOnly ? 'update note, format only' : existing ? 'update note' : 'create note'
                     } (${built.lineCount} line(s)).`
                   );
               }
@@ -1975,11 +2036,11 @@ export async function computeSyncPlan(
   // NOTES GUARD (R-034): held-back notes were never staged, but a run that held back many — or that
   // would rewrite a large share of the existing Zotero notes at once — is a sign RemNote was not
   // answering lookups, so even the notes it did build are left for the user to tick.
-  // Rewrites that only drop RemNote's hidden References portal are expected after the R-031 fix —
-  // possibly hundreds at once — so they are not counted as a mass rewrite.
+  // Rewrites that only change a note's format are expected after a format change — hundreds at once —
+  // so they are not counted as a mass rewrite.
   const existingNotes = ctx.notesByParent?.size ?? 0;
-  const portalCleanups = toPushNotes.filter((n) => n.portalCleanup).length;
-  const noteRewrites = toPushNotes.filter((n) => n.noteKey && !n.portalCleanup).length;
+  const formatOnlyNotes = toPushNotes.filter((n) => n.formatOnly).length;
+  const noteRewrites = toPushNotes.filter((n) => n.noteKey && !n.formatOnly).length;
   const massNoteRewrite =
     noteRewrites >= MASS_NOTE_REWRITE_MIN && noteRewrites >= existingNotes * MASS_NOTE_REWRITE_SHARE;
   const notesSuspect = notesHeldBack >= NOTES_HELD_SUSPECT || massNoteRewrite;
@@ -1999,7 +2060,7 @@ export async function computeSyncPlan(
 
   log?.log(
     'plan',
-    `Plan summary → create=${toCreate.length}, update=${toUpdate.length}, match=${toMatch.length}, push=${toPushTags.length}, notes=${toPushNotes.length} (portalCleanup=${portalCleanups}), notesToTrash=${toTrashNotes.length}, notesHeldBack=${notesHeldBack}, delete=${finalDelete.length}, skippedInternal=${skippedInternal}, emptyLibrarySkippedDeletes=${emptyLibrarySkippedDeletes}, partialFetchSkippedDeletes=${partialFetchSkippedDeletes}, notesSuspect=${notesSuspect}.`
+    `Plan summary → create=${toCreate.length}, update=${toUpdate.length}, match=${toMatch.length}, push=${toPushTags.length}, notes=${toPushNotes.length} (formatOnly=${formatOnlyNotes}), notesToTrash=${toTrashNotes.length}, notesHeldBack=${notesHeldBack}, delete=${finalDelete.length}, skippedInternal=${skippedInternal}, emptyLibrarySkippedDeletes=${emptyLibrarySkippedDeletes}, partialFetchSkippedDeletes=${partialFetchSkippedDeletes}, notesSuspect=${notesSuspect}.`
   );
 
   return {

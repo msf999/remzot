@@ -230,8 +230,8 @@ export const ZoteroSync = () => {
             id: e.id,
             name: e.name || '(untitled)',
             detail: `${
-              e.portalCleanup
-                ? "update Zotero note — only drops RemNote's hidden References portal"
+              e.formatOnly
+                ? 'update Zotero note — format only, your text is unchanged'
                 : `${e.noteKey ? 'update' : 'create'} Zotero note`
             } — ${e.lineCount} line${e.lineCount === 1 ? '' : 's'}`,
           })),
@@ -359,10 +359,10 @@ export const ZoteroSync = () => {
       const parts = [
         `Found ${items.length} items in Zotero — ${newPlan.alreadyPresent.length} already on Remnote, ${newPlan.toCreate.length} to create, ${newPlan.toUpdate.length} to update, ${newPlan.toMatch.length} to match, ${newPlan.toPushTags.length} to push to Zotero, ${newPlan.toPushNotes.length} note(s) to push, ${newPlan.toTrashNotes.length} note(s) to trash, ${newPlan.toFoldDuplicates.length} duplicate lookup rem(s) to fold, ${newPlan.toDelete.length} to delete.`,
       ];
-      const portalCleanups = newPlan.toPushNotes.filter((e) => e.portalCleanup).length;
-      if (portalCleanups) {
+      const formatOnly = newPlan.toPushNotes.filter((e) => e.formatOnly).length;
+      if (formatOnly) {
         parts.push(
-          `${portalCleanups} of the note pushes only drop RemNote's hidden References portal from the Zotero note — a one-time clean-up.`
+          `${formatOnly} of the note pushes only update the note's format — your text is unchanged; the Zotero note will look like the doc does in RemNote. A one-time update.`
         );
       }
       if (newPlan.toTrashNotes.length) {
