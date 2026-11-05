@@ -24,6 +24,8 @@ export const IE = {
   nextRepDateSlot: 'nextRepDate',
   repHistSlot: 'repHist',
   originalIncDateSlot: 'originalIncDate',
+  /** IE's powerup on a rem the user DISMISSED from the queue — never re-enroll one of those. */
+  dismissedPowerup: 'dismissed',
   /** Default priority IE assigns (0–100; we can't read IE's own `default-priority` setting). */
   defaultPriority: 10,
 } as const;

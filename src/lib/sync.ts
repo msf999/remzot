@@ -1930,8 +1930,9 @@ async function writeStatusTagBack(
  * setting is ON. The SDK has no cross-plugin command/messaging API, so we REPLICATE IE's tagging:
  * add IE's `incremental` powerup + write its priority / nextRepDate / repHist / originalIncDate slots
  * (mirrors IE's `initIncrementalRem`: due today, default priority, a single `madeIncremental` history
- * marker). Idempotent (skips an already-incremental rem so a re-sync can't reset its schedule) and
- * graceful: if IE isn't installed (its powerup code doesn't resolve cross-plugin) it logs + returns.
+ * marker). Idempotent (skips an already-incremental rem so a re-sync can't reset its schedule), skips a
+ * rem the user DISMISSED in IE, and is graceful: if IE isn't installed (its powerup code doesn't resolve
+ * cross-plugin) it logs + returns. Called for created AND adopted docs.
  * Never throws — a missing/renamed IE slot must not fail the Zotero sync. Codes are IE-internal
  * (see consts.ts `IE`) — undocumented coupling, kept minimal + error-swallowed.
  */
@@ -2002,6 +2003,9 @@ async function makeIncremental(
     if (await rem.hasPowerup(IE.powerup)) return; // already incremental — don't reset its schedule
     const setup = await getIncSetup(plugin, ctx, log); // null = setting off or IE not installed
     if (!setup) return;
+    // Dismissed from IE's queue by the user: leave it out. Can only happen on ADOPT (an existing doc).
+    // Checked only past the gate above: without IE the `dismissed` code does not resolve and throws.
+    if (await rem.hasPowerup(IE.dismissedPowerup)) return;
     await rem.addPowerup(IE.powerup);
     // nextRepDate + originalIncDate = today, as a daily-doc reference (IE's getDailyDocReferenceForDate).
     const dailyDoc = await plugin.date.getDailyDoc(new Date());
@@ -2065,7 +2069,8 @@ export async function createItemDoc(
   await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.lastSyncedAt, [String(syncedAt)]);
   const statusTag = await writeStatusTagBack(plugin, rem, item, log);
   // Optionally enroll the new item in Incremental Everything (gated by the `initIncremental` setting;
-  // no-op if off / IE absent). Covers BOTH create paths since both route through createItemDoc.
+  // no-op if off / IE absent). Covers BOTH create paths since both route through createItemDoc; the
+  // adopt loop in applySyncPlan calls it too.
   await makeIncremental(plugin, rem, ctx, log);
   return { rem, statusTag };
 }
@@ -2357,6 +2362,9 @@ export async function applySyncPlan(
         await appendAbstractRem(plugin, entry.rem, meta.abstract);
         countStatusTag(await writeStatusTagBack(plugin, entry.rem, entry.item, log));
         await stampSynced(entry.rem);
+        // Same Incremental Everything enrolment as a created doc (mo, 2026-11-05) — gated on the
+        // setting, idempotent, skips a doc the user dismissed, never throws.
+        await makeIncremental(plugin, entry.rem, ctx, log);
         matched += 1;
         log?.log('apply', `  adopted "${entry.name}" — stamped key ${entry.item.key} + metadata.`);
       } catch (err) {
