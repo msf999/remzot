@@ -67,9 +67,11 @@ export const SLOTS = {
 export const DEFAULT_STATUS = 'In Progress';
 
 /**
- * The Zotero-derived fields update detection may compare/overwrite. Status/Tags/Rating excluded.
- * `name` is special: it's the document's TITLE (reconciled to the Zotero citekey/displayName), not a
- * powerup slot — it's written via `rem.setText`, not `writeItemSlots`. All others are slots.
+ * The fields update detection may write. The Zotero-derived ones are compared and overwritten;
+ * Tags and Rating are never touched. `name` is special: it's the document's TITLE (reconciled to the
+ * Zotero citekey/displayName), not a powerup slot — it's written via `rem.setText`, not
+ * `writeItemSlots`. `status` is special too: it is only ever FILLED with DEFAULT_STATUS when it is
+ * empty, never compared or overwritten — a Status the user set is theirs (R-006). All others are slots.
  */
 export const UPDATABLE_FIELDS = [
   'name',
@@ -81,6 +83,7 @@ export const UPDATABLE_FIELDS = [
   'doi',
   'year',
   'collections',
+  'status',
 ] as const;
 export type UpdatableField = (typeof UPDATABLE_FIELDS)[number];
 

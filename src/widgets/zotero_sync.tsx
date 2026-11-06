@@ -209,7 +209,9 @@ export const ZoteroSync = () => {
           rows: plan.toMatch.map((e) => ({
             id: e.id,
             name: e.name || '(untitled)',
-            detail: `adopts Zotero ${e.item.key} — doc and its content are kept`,
+            detail: e.resume
+              ? `an earlier sync stopped partway through this doc — finishes it (Zotero ${e.item.key}); its content is kept`
+              : `adopts Zotero ${e.item.key} — doc and its content are kept`,
           })),
         },
         {

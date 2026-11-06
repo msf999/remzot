@@ -169,10 +169,13 @@ export interface PushEntry {
 export interface MatchEntry {
   /** Stable id (e.g. `m:<remId>`). */
   id: string;
-  /** The doc's name == the item's citation key. */
+  /** The doc's name == the item's citation key (for a `resume`, whatever the doc is called). */
   name: string;
   rem: PluginRem;
   item: ZoteroItem;
+  /** A doc carrying this item's key that an earlier create or adopt left unfinished (no version
+   *  stamped — see `finishItemDoc`): adopting it again finishes it (R-006). */
+  resume?: boolean;
 }
 
 /**
@@ -844,15 +847,73 @@ async function ensureCollectionsTree(plugin: RNPlugin, ctx: SyncContext, log?: S
 
 /** Options controlling which slots `writeItemSlots` writes. */
 export interface WriteFieldOpts {
-  /** If given, only these Zotero-derived fields are written (the update path). */
+  /** If given, only these fields are written (the update path); otherwise all of them, Status included. */
   fields?: ReadonlySet<UpdatableField>;
-  /** Write the default Status reference (create path only). */
-  setStatusOnCreate?: boolean;
+}
+
+/**
+ * Whether a doc's Status is EMPTY, or `null` when that can't be told right now. Empty means never
+ * set (an unset slot reads as undefined), only whitespace, or a reference to an option with an empty
+ * name — what RemNote stores when a select property is set to nothing (checked 2026-11-06). A
+ * reference RemNote can't look up right now is NOT taken for empty (R-034), and neither is a failed read.
+ */
+async function statusIsEmpty(plugin: RNPlugin, ctx: SyncContext, rem: PluginRem): Promise<boolean | null> {
+  try {
+    const rt = await rem.getPowerupPropertyAsRichText(ZOTERO_ITEM_POWERUP, SLOTS.status);
+    for (const el of rt ?? []) {
+      if (typeof el === 'string') {
+        if (el.trim()) return false;
+        continue;
+      }
+      const e = el as { i?: string; _id?: string; text?: string };
+      if (e.i === 'm' && !(e.text ?? '').trim()) continue;
+      if (e.i === 'q' && e._id) {
+        const name = await readRefName(plugin, ctx, e._id);
+        if (name === null) return null;
+        if (!name.trim()) continue;
+      }
+      return false;
+    }
+    return true;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fill the Status slot with DEFAULT_STATUS — but ONLY when it is empty: a Status the user set is
+ * never replaced (R-006). A Status that can't be told (one retry) is left alone. Returns what happened
+ * and the Status now on the doc ('' when unread), which create/adopt send to Zotero as a tag.
+ */
+async function fillEmptyStatus(
+  plugin: RNPlugin,
+  ctx: SyncContext,
+  rem: PluginRem,
+  log?: SyncLog
+): Promise<{ outcome: 'filled' | 'kept' | 'unread'; status: string }> {
+  let empty = await statusIsEmpty(plugin, ctx, rem);
+  if (empty === null) {
+    await new Promise<void>((r) => setTimeout(r, 250));
+    empty = await statusIsEmpty(plugin, ctx, rem);
+  }
+  if (empty === null) {
+    log?.log('apply', `  Status left as it is — the Status of rem ${rem._id} could not be read.`);
+    return { outcome: 'unread', status: '' };
+  }
+  if (!empty) {
+    const status = await slotToComparable(plugin, ctx, await getSlotRichText(rem, SLOTS.status));
+    return { outcome: 'kept', status };
+  }
+  const stRem = await ensureRefRem(plugin, ctx, HIERARCHY.statuses, DEFAULT_STATUS);
+  await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.status, await plugin.richText.rem(stRem._id).value());
+  return { outcome: 'filled', status: DEFAULT_STATUS };
 }
 
 /**
  * Write metadata slots onto an item doc. Reference rems are created before their slot value.
- * Shared by the create path (all fields + status) and the update path (selected fields only).
+ * Shared by the create/adopt path (every field) and the update path (the selected fields only).
+ * Status is only ever filled when empty (`fillEmptyStatus`); the result says whether it was, and
+ * which Status the doc now has ('' when Status wasn't among the fields or couldn't be read).
  */
 export async function writeItemSlots(
   plugin: RNPlugin,
@@ -861,7 +922,7 @@ export async function writeItemSlots(
   meta: NormalizedMeta,
   opts: WriteFieldOpts,
   log?: SyncLog
-): Promise<void> {
+): Promise<{ status: string; statusFilled: boolean }> {
   const want = (f: UpdatableField): boolean => !opts.fields || opts.fields.has(f);
   const P = ZOTERO_ITEM_POWERUP;
 
@@ -943,24 +1004,14 @@ export async function writeItemSlots(
       );
     }
   }
-  if (opts.setStatusOnCreate) {
-    const stRem = await ensureRefRem(plugin, ctx, HIERARCHY.statuses, DEFAULT_STATUS);
-    await rem.setPowerupProperty(P, SLOTS.status, await plugin.richText.rem(stRem._id).value());
+  if (want('status')) {
+    const { outcome, status } = await fillEmptyStatus(plugin, ctx, rem, log);
+    return { status, statusFilled: outcome === 'filled' };
   }
+  return { status: '', statusFilled: false };
 }
 
 // ───────────────────────── Metadata: update detection (diff) ─────────────────────────
-
-/** Read the stored Zotero version as a number (NaN if missing/unset). */
-async function storedVersion(rem: PluginRem): Promise<number> {
-  try {
-    const v = (await rem.getPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.version)).trim();
-    const n = Number(v);
-    return v && Number.isFinite(n) ? n : NaN;
-  } catch {
-    return NaN;
-  }
-}
 
 /**
  * A reference's name, or `null` when its target can't be found right now. Found names are cached per
@@ -1160,9 +1211,17 @@ export async function diffItem(
  * (one tag per picked reference — multi-word tags stay intact; typed text is whitespace-split,
  * see `slotToTagList`). Empty values are dropped and duplicates removed (first occurrence wins).
  * This is what gets written back to Zotero, replacing the item's tags exactly.
+ * `statusIfEmpty` stands in for a Status the same run is about to fill (R-006), so the pushed tag
+ * set already carries it.
  */
-async function computePushTags(plugin: RNPlugin, ctx: SyncContext, rem: PluginRem): Promise<string[]> {
-  const status = await slotToComparable(plugin, ctx, await getSlotRichText(rem, SLOTS.status));
+async function computePushTags(
+  plugin: RNPlugin,
+  ctx: SyncContext,
+  rem: PluginRem,
+  statusIfEmpty?: string
+): Promise<string[]> {
+  const status =
+    (await slotToComparable(plugin, ctx, await getSlotRichText(rem, SLOTS.status))) || (statusIfEmpty ?? '');
   const rating = await slotToComparable(plugin, ctx, await getSlotRichText(rem, SLOTS.rating));
   const tagList = await slotToTagList(plugin, ctx, await getSlotRichText(rem, SLOTS.tags));
   const raw = [status, rating, ...tagList];
@@ -1765,10 +1824,25 @@ export async function computeSyncPlan(
       }
       keptKeys.add(key);
       const item = itemByKey.get(key)!;
+      // An UNFINISHED doc: create and adopt stamp the version LAST (`finishItemDoc`), so a key with no
+      // version means an earlier run stopped partway. It goes under Will match, to be finished — doc
+      // and key kept — and nothing else is staged for it this run (R-006). Read strictly: a failed
+      // read must not pass for an unset slot.
+      const storedV = await readSlotStrict(child, SLOTS.version);
+      if (!storedV) {
+        toMatch.push({ id: `m:${child._id}`, name, rem: child, item, resume: true });
+        if (listed < LOG_LIST_CAP)
+          log?.log(
+            'plan',
+            `  FINISH "${shown}" — key ${key} but no version: an earlier sync stopped partway (id=${child._id}).`
+          );
+        listed += 1;
+        continue;
+      }
       // Cheap gate: diff only if Zotero's version advanced, or the doc predates metadata
       // (version may match but the Title slot is still empty → needs backfill), or the doc
       // predates the DOI slot (item has a DOI but the slot is empty → backfill).
-      let needDiff = (await storedVersion(child)) !== item.version;
+      let needDiff = Number(storedV) !== item.version;
       if (!needDiff)
         needDiff = !(await slotToComparable(plugin, ctx, await getSlotRichText(child, SLOTS.title)));
       if (!needDiff && item.data.DOI?.trim()) {
@@ -1804,6 +1878,11 @@ export async function computeSyncPlan(
       const realKey = item.data.citationKey?.trim();
       if (realKey && nameKey(name) !== nameKey(realKey))
         changes.unshift({ field: 'name', fromDisplay: name || '(untitled)', toDisplay: realKey });
+      // Status: an EMPTY one is filled with the default, as on create — never one the user set (R-006).
+      // Checked on every kept doc, independent of the version gate: a doc an older run left without a
+      // Status is otherwise up to date. A Status that can't be told is not taken for an empty one.
+      const statusEmpty = (await statusIsEmpty(plugin, ctx, child)) === true;
+      if (statusEmpty) changes.push({ field: 'status', fromDisplay: '(empty)', toDisplay: DEFAULT_STATUS });
       if (changes.length > 0) {
         toUpdate.push({ id: `u:${child._id}`, name, rem: child, item, changes });
         if (listed < LOG_LIST_CAP)
@@ -1820,7 +1899,7 @@ export async function computeSyncPlan(
       // user-owned fields (Status/Rating/Tags) back to Zotero as the item's exact tag set.
       // Skipped on the first run (no lastSyncAt) and when the resulting tags already match.
       if (ctx.lastSyncAt > 0 && child.updatedAt > ctx.lastSyncAt) {
-        const tags = await computePushTags(plugin, ctx, child);
+        const tags = await computePushTags(plugin, ctx, child, statusEmpty ? DEFAULT_STATUS : undefined);
         const zoteroTags = [...new Set((item.data.tags ?? []).map((t) => t.tag))];
         if (asSortedSet(tags.join('\n')) !== asSortedSet(zoteroTags.join('\n'))) {
           toPushTags.push({
@@ -1979,7 +2058,9 @@ export async function computeSyncPlan(
 
   log?.log('plan', `Existing docs already up to date: ${alreadyPresent.length}.`);
   log?.log('plan', `Existing docs to update (metadata changed): ${toUpdate.length}.`);
-  log?.log('plan', `Keyless docs matched by citekey → to adopt: ${toMatch.length}.`);
+  const toFinish = toMatch.filter((m) => m.resume).length;
+  log?.log('plan', `Keyless docs matched by citekey → to adopt: ${toMatch.length - toFinish}.`);
+  log?.log('plan', `Docs an earlier sync left unfinished → to finish: ${toFinish}.`);
   log?.log('plan', `Existing docs edited locally → tags to push to Zotero: ${toPushTags.length}.`);
   log?.log('plan', `Remnote-internal rems skipped (not user content): ${skippedInternal}.`);
   log?.log('plan', `Docs to delete (no live Zotero key): ${toDelete.length}.`);
@@ -2060,7 +2141,7 @@ export async function computeSyncPlan(
 
   log?.log(
     'plan',
-    `Plan summary → create=${toCreate.length}, update=${toUpdate.length}, match=${toMatch.length}, push=${toPushTags.length}, notes=${toPushNotes.length} (formatOnly=${formatOnlyNotes}), notesToTrash=${toTrashNotes.length}, notesHeldBack=${notesHeldBack}, delete=${finalDelete.length}, skippedInternal=${skippedInternal}, emptyLibrarySkippedDeletes=${emptyLibrarySkippedDeletes}, partialFetchSkippedDeletes=${partialFetchSkippedDeletes}, notesSuspect=${notesSuspect}.`
+    `Plan summary → create=${toCreate.length}, update=${toUpdate.length}, match=${toMatch.length} (finish=${toFinish}), push=${toPushTags.length}, notes=${toPushNotes.length} (formatOnly=${formatOnlyNotes}), notesToTrash=${toTrashNotes.length}, notesHeldBack=${notesHeldBack}, delete=${finalDelete.length}, skippedInternal=${skippedInternal}, emptyLibrarySkippedDeletes=${emptyLibrarySkippedDeletes}, partialFetchSkippedDeletes=${partialFetchSkippedDeletes}, notesSuspect=${notesSuspect}.`
   );
 
   return {
@@ -2089,10 +2170,28 @@ export async function computeSyncPlan(
 /**
  * Write-once abstract: a plain text bullet APPENDED to the doc body (create/adopt only). On a fresh
  * doc that is the first bullet; on the ADOPT path it lands BELOW the user's existing notes — the
- * position-less `setParent` used until 2026-09-05 prepended it above them.
+ * position-less `setParent` used until 2026-09-05 prepended it above them. Appended only if no
+ * top-level bullet already holds it, so finishing a doc an earlier run left half-made (R-006) can't
+ * add it twice.
  */
 async function appendAbstractRem(plugin: RNPlugin, parent: PluginRem, abstract: string): Promise<void> {
-  if (!abstract) return;
+  if (!abstract.trim()) return;
+  const want = nameKey(abstract);
+  // A bullet's text as plain text — strings and formatted runs only; anything else (a reference, an
+  // image) means it is not the abstract.
+  const plain = (rt: RichTextInterface): string | null => {
+    let s = '';
+    for (const el of rt) {
+      if (typeof el === 'string') s += el;
+      else if ((el as { i?: string }).i === 'm') s += (el as { text?: string }).text ?? '';
+      else return null;
+    }
+    return s;
+  };
+  for (const child of await parent.getChildrenRem()) {
+    const text = plain(child.text ?? []);
+    if (text !== null && nameKey(text) === want) return;
+  }
   const a = await plugin.rem.createRem();
   if (!a) return;
   await a.setText([abstract]);
@@ -2100,39 +2199,31 @@ async function appendAbstractRem(plugin: RNPlugin, parent: PluginRem, abstract: 
 }
 
 /**
- * First-sync status write-back: ADD the default Status (In Progress) to the item's existing Zotero
- * tags (additive — never replace-exactly on a first sync, so Zotero-side tags survive). Bumps the
- * item's server version and writes it to the doc's version slot. Returns the outcome for counting;
- * a failure is logged but NON-fatal (the doc is fine; a later user edit re-pushes).
+ * Status write-back: ADD the doc's Status (In Progress on a first sync) to the item's existing Zotero
+ * tags — additive, never replace-exactly, so Zotero-side tags survive. Writes nothing to the doc: it
+ * returns the item's new server version for the caller to stamp. The outcome is for counting; a
+ * failure is logged but NON-fatal (the doc is fine; a later user edit re-pushes).
  */
 async function writeStatusTagBack(
   plugin: RNPlugin,
-  rem: PluginRem,
   item: ZoteroItem,
+  status: string,
   log?: SyncLog
-): Promise<'tagged' | 'skipped' | 'failed'> {
+): Promise<{ outcome: 'tagged' | 'skipped' | 'failed'; version?: number }> {
   try {
     const existing = (item.data.tags ?? []).map((t) => t.tag);
-    if (existing.includes(DEFAULT_STATUS)) return 'skipped';
-    const newVersion = await pushItemTags(plugin, item.key, item.version, [...existing, DEFAULT_STATUS], log);
-    await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.version, [String(newVersion)]);
-    return 'tagged';
+    if (!status || existing.includes(status)) return { outcome: 'skipped' };
+    const version = await pushItemTags(plugin, item.key, item.version, [...existing, status], log);
+    return { outcome: 'tagged', version };
   } catch (err) {
     log?.log(
       'apply',
       `  STATUS TAG-BACK FAILED for Zotero ${item.key}: ${errMsg(err)} (doc is fine; edit it later to re-push).`
     );
-    return 'failed';
+    return { outcome: 'failed' };
   }
 }
 
-/**
- * Create ONE Remnote `zotero-item` document from a full ZoteroItem — the single source of truth for
- * the bulk-sync create loop AND the on-page Add-related flow. Tags the powerup, stamps key/version,
- * writes all metadata slots (+ default Status), appends the abstract body bullet, reflects the
- * status tag back to Zotero, and stamps `lastSyncedAt`. Returns the new rem + the status-tag outcome
- * (for the caller's counters). Throws if `createRem` fails.
- */
 /**
  * Make a rem an Incremental Everything (IE) "incremental rem" — ONLY when the user's `initIncremental`
  * setting is ON. The SDK has no cross-plugin command/messaging API, so we REPLICATE IE's tagging:
@@ -2247,6 +2338,50 @@ async function makeIncremental(
   }
 }
 
+/**
+ * Make `rem` a complete item doc for `item` — the shared tail of create and adopt, and what finishes a
+ * doc an earlier run left half-made. Tags it, stamps the key, writes every metadata slot (an empty
+ * Status gets the default; a set one is kept), appends the abstract unless the body already holds it,
+ * stamps `lastSyncedAt`, adds the Status to the Zotero item's tags, and enrols the doc in Incremental
+ * Everything when that setting is on. Every step is safe to repeat.
+ *
+ * The VERSION is stamped LAST (R-006). Until it is there the doc counts as unfinished, and the next
+ * preview offers it under Will match to be finished — so a run cut short (an error, a crashed popup)
+ * can no longer leave a keyed doc without its Status, abstract or Incremental enrolment that no later
+ * sync completes. Returns the status tag-back outcome for the caller's counters.
+ */
+async function finishItemDoc(
+  plugin: RNPlugin,
+  ctx: SyncContext,
+  rem: PluginRem,
+  item: ZoteroItem,
+  powerup: PluginRem,
+  syncedAt: number,
+  log?: SyncLog
+): Promise<'tagged' | 'skipped' | 'failed'> {
+  await rem.setIsDocument(true);
+  if (!(await rem.hasPowerup(ZOTERO_ITEM_POWERUP))) await rem.addTag(powerup._id);
+  await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.key, [item.key]);
+  const meta = extractMetadata(item, ctx.meta);
+  const { status } = await writeItemSlots(plugin, ctx, rem, meta, {}, log);
+  // On a fresh doc the abstract is the first body bullet; on an adopted one it lands below the notes.
+  await appendAbstractRem(plugin, rem, meta.abstract);
+  await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.lastSyncedAt, [String(syncedAt)]);
+  const tagBack = await writeStatusTagBack(plugin, item, status, log);
+  // Gated on the `initIncremental` setting; a no-op when it is off or IE is absent; never throws.
+  await makeIncremental(plugin, rem, ctx, log);
+  // LAST: the stamp that marks the doc finished — the version after our own tag push, so the next
+  // preview doesn't re-diff the item over it.
+  await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.version, [String(tagBack.version ?? item.version)]);
+  return tagBack.outcome;
+}
+
+/**
+ * Create ONE Remnote `zotero-item` document from a full ZoteroItem — the single source of truth for
+ * the bulk-sync create loop AND the on-page Add-related flow (and Convert Inline Citations). Names it
+ * and puts it at the top of Items, then `finishItemDoc` does the rest. Returns the new rem + the
+ * status-tag outcome (for the caller's counters). Throws if `createRem` fails.
+ */
 export async function createItemDoc(
   plugin: RNPlugin,
   ctx: SyncContext,
@@ -2262,24 +2397,7 @@ export async function createItemDoc(
   // Insert at the TOP of Items (positionAmongstSiblings 0), not the bottom, so freshly-added items
   // are immediately visible. (In a bulk create, items thus appear newest-first within the run.)
   await rem.setParent(parent, 0);
-  await rem.setIsDocument(true);
-  await rem.addTag(powerup._id);
-  await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.key, [item.key]);
-  await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.version, [String(item.version)]);
-  const meta = extractMetadata(item, ctx.meta);
-  await writeItemSlots(plugin, ctx, rem, meta, { setStatusOnCreate: true }, log);
-  // The abstract lands as the doc's first body bullet (fresh doc → no other body children yet).
-  await appendAbstractRem(plugin, rem, meta.abstract);
-  // Stamp lastSyncedAt BEFORE the (network) status tag-back so a local-write failure can't hide a
-  // tag-back that already succeeded — writeStatusTagBack swallows its own errors and never throws,
-  // so the return (and the caller's counter) always runs once we reach it. The two writes target
-  // different slots, so the order is otherwise immaterial.
-  await rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.lastSyncedAt, [String(syncedAt)]);
-  const statusTag = await writeStatusTagBack(plugin, rem, item, log);
-  // Optionally enroll the new item in Incremental Everything (gated by the `initIncremental` setting;
-  // no-op if off / IE absent). Covers BOTH create paths since both route through createItemDoc; the
-  // adopt loop in applySyncPlan calls it too.
-  await makeIncremental(plugin, rem, ctx, log);
+  const statusTag = await finishItemDoc(plugin, ctx, rem, item, powerup, syncedAt, log);
   return { rem, statusTag };
 }
 
@@ -2421,13 +2539,15 @@ export async function applySyncPlan(
   if (deleted > LOG_LIST_CAP)
     log?.log('apply', `  … (${deleted - LOG_LIST_CAP} more successful deletions not individually listed)`);
 
+  // Docs whose tags this run also pushes: a Status filled in the update phase reaches Zotero with that push.
+  const pushingTags = new Set(selection.toPushTags.map((e) => e.rem._id));
   let updated = 0;
   let updateFailed = 0;
   for (const sel of selection.toUpdate) {
     let ok = true;
     try {
       const meta = extractMetadata(sel.entry.item, ctx.meta);
-      await writeItemSlots(plugin, ctx, sel.entry.rem, meta, { fields: sel.fields }, log);
+      const { status, statusFilled } = await writeItemSlots(plugin, ctx, sel.entry.rem, meta, { fields: sel.fields }, log);
       // `name` isn't a powerup slot — reconcile the doc title to the REAL Zotero citekey via setText.
       // (computeSyncPlan only stages a `name` change when a real citationKey exists, so it's present.)
       if (sel.fields.has('name')) {
@@ -2437,10 +2557,16 @@ export async function applySyncPlan(
       // Only advance the stored version if every changed field was applied; otherwise leave
       // it so the un-applied fields resurface on the next sync.
       const allApplied = sel.entry.changes.every((c) => sel.fields.has(c.field));
+      let version = sel.entry.item.version;
+      // A Status filled just now goes to Zotero as a tag, as on create (R-006) — unless this run
+      // pushes the item's tags anyway: that push carries it, and a tag-back first would make it a 412.
+      if (statusFilled && !pushingTags.has(sel.entry.rem._id)) {
+        const tagBack = await writeStatusTagBack(plugin, sel.entry.item, status, log);
+        countStatusTag(tagBack.outcome);
+        if (tagBack.version !== undefined) version = tagBack.version;
+      }
       if (allApplied) {
-        await sel.entry.rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.version, [
-          String(sel.entry.item.version),
-        ]);
+        await sel.entry.rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.version, [String(version)]);
       }
       await stampSynced(sel.entry.rem);
       updated += 1;
@@ -2576,8 +2702,9 @@ export async function applySyncPlan(
   if ((selection.toTrashNotes ?? []).length > 0)
     log?.log('apply', `notes: ${notesTrashed} of ${(selection.toTrashNotes ?? []).length} moved to the Zotero trash.`);
 
-  // Adopt phase: stamp identity onto citekey-matched keyless docs and backfill their metadata.
-  // The rem (and its children / inbound references) is preserved — that's the whole point.
+  // Adopt phase: stamp identity onto citekey-matched keyless docs and backfill their metadata, and
+  // finish docs an earlier run left unfinished (`resume`, R-006). The rem (and its children / inbound
+  // references) is preserved — that's the whole point.
   let matched = 0;
   let matchFailed = 0;
   if (selection.toMatch.length > 0) {
@@ -2585,22 +2712,15 @@ export async function applySyncPlan(
     for (const entry of selection.toMatch) {
       let ok = true;
       try {
-        await entry.rem.addTag(powerup._id);
-        await entry.rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.key, [entry.item.key]);
-        await entry.rem.setPowerupProperty(ZOTERO_ITEM_POWERUP, SLOTS.version, [
-          String(entry.item.version),
-        ]);
-        await entry.rem.setIsDocument(true);
-        const meta = extractMetadata(entry.item, ctx.meta);
-        await writeItemSlots(plugin, ctx, entry.rem, meta, { setStatusOnCreate: true }, log);
-        await appendAbstractRem(plugin, entry.rem, meta.abstract);
-        countStatusTag(await writeStatusTagBack(plugin, entry.rem, entry.item, log));
-        await stampSynced(entry.rem);
-        // Same Incremental Everything enrolment as a created doc (mo, 2026-11-05) — gated on the
-        // setting, idempotent, skips a doc the user dismissed, never throws.
-        await makeIncremental(plugin, entry.rem, ctx, log);
+        // The same steps as a create, Incremental Everything enrolment included (mo, 2026-11-05).
+        countStatusTag(await finishItemDoc(plugin, ctx, entry.rem, entry.item, powerup, syncedAt, log));
         matched += 1;
-        log?.log('apply', `  adopted "${entry.name}" — stamped key ${entry.item.key} + metadata.`);
+        log?.log(
+          'apply',
+          entry.resume
+            ? `  finished "${entry.name}" (key ${entry.item.key}) — an earlier sync had stopped partway.`
+            : `  adopted "${entry.name}" — stamped key ${entry.item.key} + metadata.`
+        );
       } catch (err) {
         ok = false;
         matchFailed += 1;
@@ -2659,7 +2779,8 @@ export interface SingleSyncResult {
   status: 'synced' | 'missing-key' | 'not-found';
   /** The doc's (post-sync) display name, for the toast. */
   name: string;
-  /** Names of the metadata fields rewritten from Zotero this run (incl. a 'name' reconcile). */
+  /** Names of the metadata fields rewritten from Zotero this run (incl. a 'name' reconcile, and 'status'
+   *  when an empty Status was filled). */
   pulled: string[];
   /** Tags written back to Zotero (replace-exactly), or null when they already matched. */
   pushed: string[] | null;
@@ -2678,7 +2799,8 @@ export interface SingleSyncResult {
  * Returns 'missing-key' (no key stored) or 'not-found' (HTTP 404 — deleted from Zotero) WITHOUT
  * throwing; THROWS on credential / network / 412-version-conflict errors so the caller can toast.
  * Does NOT touch the global STORAGE.lastSync baseline (that gates the library-wide push) or the
- * doc body / abstract.
+ * doc body / abstract — except on a doc an earlier run left unfinished, which it finishes instead
+ * (`finishItemDoc`, abstract included). An empty Status is filled with the default (R-006).
  *
  * Notes are pushed from here too (2026-09-01), unconditionally — see the NOTES block below.
  */
@@ -2713,6 +2835,18 @@ export async function syncSingleItem(
     };
   }
 
+  // An UNFINISHED doc (a key but no version — see `finishItemDoc`): finish it as the bulk sync's Will
+  // match would, and stop there. The replace-exactly tag push below would drop the Zotero-side tags a
+  // first sync only ever adds to (R-006).
+  if (!(await readSlotStrict(rem, SLOTS.version))) {
+    const powerup = await plugin.powerup.getPowerupByCode(ZOTERO_ITEM_POWERUP);
+    if (!powerup) throw new Error('Zotero Item powerup is not registered — reload the plugin.');
+    await finishItemDoc(plugin, ctx, rem, item, powerup, Date.now(), log);
+    const message = `Finished setting up "${name}" — an earlier sync had stopped partway.`;
+    log?.log('apply', message);
+    return { status: 'synced', name, pulled: [], pushed: null, message };
+  }
+
   // PULL: rewrite changed metadata slots, then reconcile the doc name to the Zotero citekey.
   const meta = extractMetadata(item, ctx.meta);
   const changes = await diffItem(plugin, ctx, rem, meta);
@@ -2724,6 +2858,9 @@ export async function syncSingleItem(
   const nameChanged = !!realKey && nameKey(name) !== nameKey(realKey);
   if (nameChanged) await rem.setText([realKey!]);
   const wantName = nameChanged ? realKey! : name;
+  // An empty Status gets the default, as on create — never one the user set (R-006). Before the tag
+  // push below, so the pushed set carries it.
+  const statusFilled = (await fillEmptyStatus(plugin, ctx, rem, log)).outcome === 'filled';
   const pulled = [...pulledFields].map(String).concat(nameChanged ? ['name'] : []);
 
   // PUSH: user-owned tags → Zotero (replace-exactly), only when they differ from the live set.
@@ -2780,6 +2917,7 @@ export async function syncSingleItem(
 
   const parts: string[] = [];
   if (pulled.length) parts.push(`refreshed ${pulled.join(', ')}`);
+  if (statusFilled) parts.push(`set the empty Status to ${DEFAULT_STATUS}`);
   if (pushed) parts.push(`pushed ${pushed.length} tag${pushed.length === 1 ? '' : 's'} to Zotero`);
   if (notesPushed) parts.push('pushed notes to Zotero');
   if (notesHeld)
@@ -2790,7 +2928,7 @@ export async function syncSingleItem(
     ? `Synced "${wantName}" — ${parts.join(', ')}.`
     : `"${wantName}" is already up to date.`;
   log?.log('apply', message);
-  return { status: 'synced', name: wantName, pulled, pushed, message };
+  return { status: 'synced', name: wantName, pulled: statusFilled ? [...pulled, 'status'] : pulled, pushed, message };
 }
 
 // ───────────────────────── Add a related paper to Zotero + Remnote ─────────────────────────
