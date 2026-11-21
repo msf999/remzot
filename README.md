@@ -72,6 +72,10 @@ Below the title of every synced item, Remzot renders a quiet card with:
   Crossref, Semantic Scholar, OpenAlex, and OpenCitations, deduped by DOI, each row showing
   citation metrics and a one-click **Add to Zotero** (it lands in both Zotero and Remnote).
 
+When the item is also in [Incremental Everything](https://github.com/bjsi/incremental-everything), the
+card sits below its 📚 Inc Rems chip: if Remzot starts first, it moves its card down once that chip
+appears (the card redraws once).
+
 ### Convert inline citations
 Highlights and notes copied from a paper keep its citation numbers — *"as reported earlier [12, 15]"*.
 Put the cursor in such a rem (or select several, or open the paper) and run **Remzot: Convert Inline

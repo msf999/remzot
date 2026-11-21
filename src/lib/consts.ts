@@ -139,5 +139,8 @@ export const SYNC_WIDGET = 'zotero_sync';
 /** Widget file name (matches src/widgets/item_menu.tsx) — the on-page menu on item docs. */
 export const ITEM_MENU_WIDGET = 'item_menu';
 
+/** This plugin's id — must equal `id` in public/manifest.json (lib/menuOrder.ts finds the menu by it). */
+export const REMZOT_PLUGIN_ID = 'remzot';
+
 /** Widget file name (matches src/widgets/convert_citations.tsx) — the Convert Inline Citations popup. */
 export const CONVERT_WIDGET = 'convert_citations';

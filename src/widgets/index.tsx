@@ -9,9 +9,9 @@ import {
 import '../style.css';
 import '../index.css';
 import { openConvertCitations, trackEditorFocus } from '../lib/citeConvert';
+import { keepMenuBelowIncremental, registerItemMenu } from '../lib/menuOrder';
 import {
   CONVERT_WIDGET,
-  ITEM_MENU_WIDGET,
   SESSION,
   SETTINGS,
   SLOTS,
@@ -118,9 +118,9 @@ async function onActivate(plugin: ReactRNPlugin) {
   // mount on EVERY document (exactly like Incremental Everything's per-doc inc_rem_counter) and
   // the component decides whether to render: it returns null unless the doc has the zotero-item
   // powerup. Reactivity across navigation comes from the SESSION.navTick key bumped below.
-  await plugin.app.registerWidget(ITEM_MENU_WIDGET, WidgetLocation.DocumentBelowTitle, {
-    dimensions: { height: 'auto', width: '100%' },
-  });
+  // It is kept below Incremental Everything's chip under the title (lib/menuOrder.ts; mo,
+  // 2026-11-22): checked every second for the first minute, then on every navigation (below).
+  await registerItemMenu(plugin);
 
   // RemNote reuses DocumentBelowTitle widget iframes across in-app navigation, and
   // getWidgetContext is not reactive — without a signal the menu shows STALE data on the next
@@ -133,6 +133,8 @@ async function onActivate(plugin: ReactRNPlugin) {
     } catch {
       // navigation signal only — never let it throw
     }
+    // Incremental Everything reloaded since the first minute puts its chip after the menu.
+    void keepMenuBelowIncremental(plugin);
   });
 
   // Every command carries the "Remzot:" prefix so they are easy to find in the omnibar (mo, 2026-11-05).
