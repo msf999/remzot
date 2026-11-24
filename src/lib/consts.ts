@@ -131,6 +131,16 @@ export const SESSION = {
    */
   lastFocus: 'remzot-last-focus',
   lastSelection: 'remzot-last-selection',
+  /**
+   * The on-page menu writes what it shows on each page under `menuStatePrefix + <docId>` (a
+   * `MenuState`, lib/citeDebug.ts), for "Remzot: Debug Citations Bar" — another iframe — to read.
+   */
+  menuStatePrefix: 'remzot-menu-state:',
+  /**
+   * The debug popup's Refresh: `{ docId, at }`. The menu showing that page reads it again, drops its
+   * cached citation lists and asks the sources again.
+   */
+  citeRefresh: 'remzot-cite-refresh',
 } as const;
 
 /** Widget file name (matches src/widgets/zotero_sync.tsx). */
@@ -144,3 +154,6 @@ export const REMZOT_PLUGIN_ID = 'remzot';
 
 /** Widget file name (matches src/widgets/convert_citations.tsx) — the Convert Inline Citations popup. */
 export const CONVERT_WIDGET = 'convert_citations';
+
+/** Widget file name (matches src/widgets/cite_debug.tsx) — the "Debug Citations Bar" popup. */
+export const CITE_DEBUG_WIDGET = 'cite_debug';

@@ -1,8 +1,9 @@
 /**
  * On-page "citekey menu" for documents tagged `zotero-item`.
  *
- * Renders below the document title (WidgetLocation.DocumentBelowTitle) and clones the layout of
- * zoteroRoam's citekey menu (Information/zotero-roam-main … CitekeyMenu.tsx): a card holding a
+ * Renders below the document's title and properties (WidgetLocation.DocumentBelowTitle) and clones
+ * the layout of zoteroRoam's citekey menu (github.com/alixlahuec/zotero-roam,
+ * src/components/GraphWatcher/Menus/CitekeyMenu.tsx): a card holding a
  * wrapping row of action buttons + a functional Scite badge, a citations bar (references /
  * citations / related library items), and an expandable related-items list. Styling is
  * RemNote-native (rn-clr-* + Tailwind), not BlueprintJS.
@@ -29,6 +30,7 @@ import { renderWidget, usePlugin, useTrackerPlugin, WidgetLocation } from '@remn
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { SESSION, SETTINGS, SLOTS, ZOTERO_ITEM_POWERUP } from '../lib/consts';
 import { BRAND_ICONS } from '../lib/brandIcons';
+import { failedSources, type MenuState, menuStateKey } from '../lib/citeDebug';
 import { safeRichTextToString } from '../lib/notes';
 import { addRelatedItem, buildSyncContext, type SyncContext, syncSingleItem } from '../lib/sync';
 import { fetchItemByKey } from '../lib/zoteroApi';
@@ -39,13 +41,17 @@ import {
   fetchJournalMetrics,
   fetchPaperMetrics,
   fetchSciteTallies,
+  forgetSources,
   type JournalMetric,
+  lastSourceChecks,
   type MultiSourceResult,
   normalizeDoi,
   type PaperMetrics,
   registerAddedItem,
   type RelatedPaper,
   type SciteTally,
+  sourcesAskedSince,
+  type SourceCheck,
 } from '../lib/semantic';
 
 interface ItemData {
@@ -59,6 +65,31 @@ interface ItemData {
   username: string;
   /** Epoch-ms (as string) of this doc's last per-item Sync; '' if never synced. */
   lastSyncedAt: string;
+  /** For the debug popup: the latest page change (SESSION.navTick) and this page's Refresh request
+   *  (its `at`, 0 if none) as of this read of the page. */
+  navAt: number;
+  refreshAt: number;
+}
+
+/** What the tracker gives when the menu draws nothing on a page: RemNote returned nothing for the page,
+ *  didn't report the Zotero Item tag on it, or a read failed. Kept (not just null) so the debug popup
+ *  can say why. */
+interface NothingShown {
+  documentId: string;
+  missing: 'page' | 'not-item' | 'error';
+  error?: string;
+  navAt: number;
+  refreshAt: number;
+}
+
+/** A Refresh request older than this is ignored: its popup stopped waiting long ago (another pane that
+ *  shows the page later must not answer it then). */
+const REFRESH_ANSWER_MS = 60_000;
+
+/** The debug popup's Refresh request (SESSION.citeRefresh). */
+interface RefreshRequest {
+  docId: string;
+  at: number;
 }
 
 /** Subtle border color that adapts to light/dark via RemNote's CSS vars (with a safe fallback). */
@@ -892,6 +923,11 @@ interface SemState {
   doi: string;
   /** Per-source counts + related items; null while loading or on an unexpected failure. */
   result: MultiSourceResult | null;
+  /** How the sources answered for `result`, and when they were asked (for the debug popup). */
+  checks?: { at: number; checks: SourceCheck[] };
+  /** When this load began, and why it gave no result (for the debug popup). */
+  startedAt?: number;
+  error?: string;
 }
 const SEM_IDLE: SemState = { status: 'idle', doi: '', result: null };
 
@@ -944,41 +980,73 @@ function ItemMenu() {
   // In-flight guard for the one-time collection-list load (React `colls` lags a click by a render).
   const collsLoadingRef = useRef(false);
 
-  const data = useTrackerPlugin<ItemData | null>(async (rp) => {
+  const tracked = useTrackerPlugin<ItemData | NothingShown | null>(async (rp) => {
     // RemNote REUSES this widget iframe across in-app navigation (verified live: the menu kept
     // showing the previous item's data on an unrelated page), and getWidgetContext is NOT
     // reactive. This session read IS reactive — index.tsx bumps the key on AppEvents.URLChange,
     // which re-runs this tracker so the context is re-queried for the new document.
-    await rp.storage.getSession(SESSION.navTick);
+    const navAt = Number(await rp.storage.getSession(SESSION.navTick).catch(() => 0)) || 0;
+    // "Remzot: Debug Citations Bar"'s Refresh: read the page again (the effect below re-asks the sources).
+    const refresh = (await rp.storage.getSession<RefreshRequest>(SESSION.citeRefresh).catch(() => undefined)) ?? null;
+    // NEVER throw from here: in SDK 0.0.46 a tracker that throws once never runs again (useTrackerPlugin's
+    // "running" flag stays set), which would freeze the menu on this frame for good.
+    let documentId = '';
+    let refreshAt = 0;
+    try {
+      const ctx = await rp.widget.getWidgetContext<WidgetLocation.DocumentBelowTitle>();
+      if (!ctx?.documentId) return null;
+      documentId = ctx.documentId;
+      refreshAt = refresh && refresh.docId === documentId ? refresh.at : 0;
+      const rem = await rp.rem.findOne(documentId);
+      if (!rem) return { documentId, missing: 'page', navAt, refreshAt };
+      // Guard: only render on our item docs, whatever the registration filter's semantics are.
+      if (!(await rem.hasPowerup(ZOTERO_ITEM_POWERUP))) return { documentId, missing: 'not-item', navAt, refreshAt };
 
-    const ctx = await rp.widget.getWidgetContext<WidgetLocation.DocumentBelowTitle>();
-    if (!ctx?.documentId) return null;
-    const rem = await rp.rem.findOne(ctx.documentId);
-    if (!rem) return null;
-    // Guard: only render on our item docs, whatever the registration filter's semantics are.
-    if (!(await rem.hasPowerup(ZOTERO_ITEM_POWERUP))) return null;
-
-    const citekey = (await safeRichTextToString(rp, rem.text)).trim();
-    const get = async (slot: string): Promise<string> => {
-      try {
-        return ((await rem.getPowerupProperty(ZOTERO_ITEM_POWERUP, slot)) ?? '').trim();
-      } catch {
-        return '';
-      }
-    };
-    const [title, doi, year, zoteroKey, lastSyncedAt] = await Promise.all([
-      get(SLOTS.title),
-      get(SLOTS.doi),
-      get(SLOTS.year),
-      get(SLOTS.key),
-      get(SLOTS.lastSyncedAt),
-    ]);
-    // The zotero.org WEB library needs the username SLUG — numeric-userId item URLs 404
-    // (verified live 2026-06-13), so the web button stays disabled until the optional
-    // "Zotero Username" setting is filled in.
-    const username = String((await rp.settings.getSetting(SETTINGS.username)) ?? '').trim();
-    return { documentId: ctx.documentId, citekey, title, doi, year, zoteroKey, username, lastSyncedAt };
+      const citekey = (await safeRichTextToString(rp, rem.text)).trim();
+      const get = async (slot: string): Promise<string> => {
+        try {
+          return ((await rem.getPowerupProperty(ZOTERO_ITEM_POWERUP, slot)) ?? '').trim();
+        } catch {
+          return '';
+        }
+      };
+      const [title, doi, year, zoteroKey, lastSyncedAt] = await Promise.all([
+        get(SLOTS.title),
+        get(SLOTS.doi),
+        get(SLOTS.year),
+        get(SLOTS.key),
+        get(SLOTS.lastSyncedAt),
+      ]);
+      // The zotero.org WEB library needs the username SLUG — numeric-userId item URLs 404
+      // (verified live 2026-06-13), so the web button stays disabled until the optional
+      // "Zotero Username" setting is filled in.
+      const username = String((await rp.settings.getSetting(SETTINGS.username).catch(() => '')) ?? '').trim();
+      return { documentId, citekey, title, doi, year, zoteroKey, username, lastSyncedAt, navAt, refreshAt };
+    } catch (e) {
+      if (!documentId) return null;
+      return { documentId, missing: 'error', error: e instanceof Error ? e.message || e.name : String(e), navAt, refreshAt };
+    }
   }, []);
+  const data: ItemData | null = tracked && !('missing' in tracked) ? tracked : null;
+
+  // "Remzot: Debug Citations Bar"'s Refresh for this page, answered once the tracker above has read the
+  // page again: drop the cached lists (stopping a lookup under way) and ask the sources again. A request
+  // made before this frame existed is old news (it drew the page afresh since), and so is one older than
+  // REFRESH_ANSWER_MS — its popup stopped waiting long ago.
+  const refreshAt = tracked?.refreshAt ?? 0;
+  const pageDoi = data?.doi ?? '';
+  const mountedAtRef = useRef(Date.now());
+  const [answeredRefresh, setAnsweredRefresh] = useState(0);
+  const [askTick, setAskTick] = useState(0);
+  useEffect(() => {
+    if (!refreshAt || refreshAt === answeredRefresh) return;
+    if (refreshAt < mountedAtRef.current || Date.now() - refreshAt > REFRESH_ANSWER_MS) return;
+    if (pageDoi) {
+      forgetSources(pageDoi);
+      setAskTick((t) => t + 1);
+    }
+    setAnsweredRefresh(refreshAt);
+  }, [refreshAt, answeredRefresh, pageDoi]);
 
   // Collapse the open list + drop this-session adds whenever the underlying document changes.
   const docKey = data?.zoteroKey ?? '';
@@ -991,7 +1059,8 @@ function ItemMenu() {
   // Papers that "Remzot: Convert Inline Citations" just added (its popup is another iframe, with its
   // own caches): flip their rows to "✓ In library" here too, without a refetch.
   const addedByConvert = useTrackerPlugin<{ doi: string; remId: string; name: string }[]>(
-    async (rp) => ((await rp.storage.getSession(SESSION.addedPapers)) as { doi: string; remId: string; name: string }[]) ?? [],
+    async (rp) =>
+      ((await rp.storage.getSession(SESSION.addedPapers).catch(() => undefined)) as { doi: string; remId: string; name: string }[] | undefined) ?? [],
     []
   );
   useEffect(() => {
@@ -1043,21 +1112,29 @@ function ItemMenu() {
       return;
     }
     let cancelled = false;
-    setSem({ status: 'loading', doi, result: null });
+    setSem({ status: 'loading', doi, result: null, startedAt: Date.now() });
     fetchAllSources(doi, plugin)
       .then((result) => {
-        if (!cancelled) setSem({ status: 'done', doi, result });
+        if (cancelled) return;
+        setSem({
+          status: 'done',
+          doi,
+          result,
+          checks: lastSourceChecks(doi),
+          error: result ? undefined : `"${doi}" can't be used to ask the sources`,
+        });
       })
       .catch((err) => {
         // fetchAllSources isolates each source so it shouldn't reject; a hard failure → all dashes.
         if (cancelled) return;
         console.error('Remzot citation-sources lookup failed:', err);
-        setSem({ status: 'done', doi, result: null });
+        setSem({ status: 'done', doi, result: null, error: `the lookup failed: ${err instanceof Error ? err.message : String(err)}` });
       });
     return () => {
       cancelled = true;
     };
-  }, [doi, plugin]);
+    // askTick: the debug popup's Refresh asks again for the same DOI.
+  }, [doi, plugin, askTick]);
 
   // scite tallies (focus + rows) AND importance metrics (rows) — batched/cached, OFF the bar's critical
   // path. Re-runs when the doc changes (focus only, while the lists load) and again when `sem` resolves
@@ -1146,6 +1223,39 @@ function ItemMenu() {
     }
     return out;
   }, [refs, cites, relatedWorks, justAdded]);
+
+  // What this menu shows on its page, for "Remzot: Debug Citations Bar" (another iframe) to read:
+  // written whenever it changes. The "loading" state's `at` therefore says how long the menu has
+  // been asking the sources.
+  // Every page change makes it write again (navAt), so a report older than the latest page change shows
+  // the menu didn't draw that page since — gone from the page, or frozen.
+  const pageId = tracked?.documentId ?? '';
+  const menuReport: Omit<MenuState, 'at'> | null = !tracked
+    ? null
+    : 'missing' in tracked
+    ? { missing: tracked.missing, error: tracked.error, navAt: tracked.navAt }
+    : !tracked.doi
+    ? { doi: '', bar: 'hidden', navAt: tracked.navAt }
+    : semForDoc.status !== 'done'
+    ? { doi: tracked.doi, bar: 'loading', askingSince: sourcesAskedSince(tracked.doi) ?? semForDoc.startedAt, navAt: tracked.navAt }
+    : {
+        doi: tracked.doi,
+        bar: 'shown',
+        counts: { references: refs.length, inLibrary: inLibrary.length, citations: cites.length, related: relatedWorks.length },
+        askedAt: semForDoc.checks?.at,
+        failed: semForDoc.checks ? failedSources(semForDoc.checks.checks) : semForDoc.error ? [semForDoc.error] : [],
+        navAt: tracked.navAt,
+      };
+  // `refreshed` only for this page's own request (answeredRefresh can belong to a page shown before).
+  const refreshed = answeredRefresh && answeredRefresh === refreshAt ? answeredRefresh : undefined;
+  const reportKey = menuReport ? JSON.stringify({ ...menuReport, refreshed }) : '';
+  useEffect(() => {
+    if (!pageId || !reportKey) return;
+    const state: MenuState = { ...(JSON.parse(reportKey) as Omit<MenuState, 'at'>), at: Date.now() };
+    plugin.storage.setSession(menuStateKey(pageId), state).catch(() => {
+      // a report for the debug popup only — never let it throw
+    });
+  }, [pageId, reportKey, plugin]);
 
   const baseList: RelatedPaper[] =
     openList === 'refs'

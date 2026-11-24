@@ -429,14 +429,16 @@ export async function fetchTopItems(
 export async function fetchItemByKey(
   plugin: RNPlugin,
   itemKey: string,
-  log?: SyncLog
+  log?: SyncLog,
+  signal?: AbortSignal
 ): Promise<ZoteroItem | null> {
   const { userId, headers } = await readZoteroCreds(plugin, log);
   const url = `${ZOTERO_API_BASE}/users/${encodeURIComponent(userId)}/items/${encodeURIComponent(
     itemKey
   )}`;
   log?.log('fetch', `Endpoint: GET ${url} (single item).`);
-  const res = await zoteroFetch(url, { headers });
+  // `signal` (the debug popup's time limit) also cuts short zoteroFetch's waits between retries.
+  const res = await zoteroFetch(url, { headers, signal });
   if (res.status === 404) {
     log?.log('fetch', `Item ${itemKey} not found in Zotero (HTTP 404).`);
     return null;
@@ -1251,8 +1253,9 @@ function containerTitle(data: ZoteroItem['data']): string {
  * Many item types (book/report/thesis/dataset/preprint) store their DOI in the free-text `extra`
  * field as a `DOI: 10.x/…` line rather than in `data.DOI`. Pull it out so those items still get a
  * clickable DOI + the citations/related/scite pipeline. Strips a leading doi.org URL if present.
+ * (Exported for the citations-bar debug popup, which asks Zotero for the item's DOI.)
  */
-function parseDoiFromExtra(extra?: string): string {
+export function parseDoiFromExtra(extra?: string): string {
   if (!extra) return '';
   const m = extra.match(/^\s*DOI:\s*(\S+)/im);
   if (!m) return '';

@@ -63,7 +63,7 @@ bar and a completion summary. Safety guards suppress deletions when a fetch look
 truncated, so a transient network hiccup can't wipe your tree.
 
 ### On-page item menu
-Below the title of every synced item, Remzot renders a quiet card with:
+On every synced item's page, below its properties, Remzot renders a quiet card with:
 - a one-click **per-item Sync** (pulls metadata, pushes your Status/Rating/Tags);
 - **brand-icon links** out to Zotero (app & web), Connected Papers, Semantic Scholar, Google
   Scholar, OpenAlex, Inciteful, Litmaps, and ResearchRabbit;
@@ -75,6 +75,15 @@ Below the title of every synced item, Remzot renders a quiet card with:
 When the item is also in [Incremental Everything](https://github.com/bjsi/incremental-everything), the
 card sits below its 📚 Inc Rems chip: if Remzot starts first, it moves its card down once that chip
 appears (the card redraws once).
+
+**Citations bar empty?** Open the item and run **Remzot: Debug Citations Bar** (quick code `zdebug`).
+A popup says why the bar shows what it does — the menu couldn't read the item's DOI, the item has no
+DOI (in Remnote or in Zotero), a source failed or is still being asked, or the sources really have
+nothing for the paper — and what to do. It shows what the menu last displayed on that page, the DOI
+read three ways, and each source asked afresh with its answer; **Refresh the menu** makes the menu
+read the page and ask the sources again (stopping a lookup still under way), and **Copy report** copies
+it all as text. A list that came back empty because a source failed is kept for a minute at most, so a
+later visit asks again.
 
 ### Convert inline citations
 Highlights and notes copied from a paper keep its citation numbers — *"as reported earlier [12, 15]"*.

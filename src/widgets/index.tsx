@@ -9,8 +9,10 @@ import {
 import '../style.css';
 import '../index.css';
 import { openConvertCitations, trackEditorFocus } from '../lib/citeConvert';
+import { DEBUG_COMMAND, openCiteDebug } from '../lib/citeDebug';
 import { keepMenuBelowIncremental, registerItemMenu } from '../lib/menuOrder';
 import {
+  CITE_DEBUG_WIDGET,
   CONVERT_WIDGET,
   SESSION,
   SETTINGS,
@@ -111,7 +113,7 @@ async function onActivate(plugin: ReactRNPlugin) {
     dimensions: { height: 800, width: 1000 },
   });
 
-  // --- On-page menu (zoteroRoam-style; design-only dummy for now) ---
+  // --- On-page menu (zoteroRoam-style) ---
   // Registered WITHOUT powerupFilter, on purpose: a filtered DocumentBelowTitle widget did NOT
   // re-mount on in-app (SPA) navigation — it showed only on the page that was active at plugin
   // load and never appeared after navigating to another item (verified live 2026-06-13). So we
@@ -159,6 +161,19 @@ async function onActivate(plugin: ReactRNPlugin) {
     quickCode: 'zcite',
     action: async () => {
       await openConvertCitations(plugin);
+    },
+  });
+
+  // --- Debug Citations Bar: why the on-page menu's citations bar shows nothing / zeros (lib/citeDebug.ts) ---
+  await plugin.app.registerWidget(CITE_DEBUG_WIDGET, WidgetLocation.Popup, {
+    dimensions: { height: 720, width: 900 },
+  });
+  await plugin.app.registerCommand({
+    id: 'debug-citations-bar',
+    name: DEBUG_COMMAND,
+    quickCode: 'zdebug',
+    action: async () => {
+      await openCiteDebug(plugin);
     },
   });
 }
