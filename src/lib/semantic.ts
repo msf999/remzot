@@ -12,7 +12,8 @@
  * Each source is fetched independently and never throws — a failure just contributes nothing. The
  * merged unique lists drive the bar's reference/citation COUNTS and
  * the inline collapsible item lists; the in-library subset is the "related library items". Results
- * are cached per DOI (module-level) so each item is fetched once per session.
+ * are cached per DOI (module-level) so each item is fetched once per session. Each source gets 45 s,
+ * and details, scite tallies and metrics are looked up for at most 1,000 works (R-047, 2026-11-25).
  *
  * Metadata for display (title/authors/year/venue) is taken from whichever source has it (OpenAlex + S2
  * are richest; Crossref partial; OpenCitations DOI-only). After merging, any row that has a DOI but is
@@ -97,6 +98,18 @@ export interface MultiSourceResult {
   /** Topically-related works (NOT citation-linked) — the union of OpenAlex `related_works` + Semantic
    *  Scholar recommendations, deduped. Drives the "Related" tab. */
   relatedWorks: RelatedPaper[];
+  /** Set when `citations` is cut short (see citationsCut). */
+  citationsCut?: CitationsCut;
+}
+
+/** Why a paper's Citations list is cut short, and how many works cite it. */
+export interface CitationsCut {
+  /** How many works OpenAlex counts as citing the paper (undefined when it didn't say). */
+  total?: number;
+  /** The sources that sent only their first works (Semantic Scholar 1,000, OpenAlex 600), and how many. */
+  limited: { source: SourceName; count: number }[];
+  /** OpenCitations — the one source that sends every citation — which gave too few here. */
+  openCitations?: SourceCheck;
 }
 
 /** A raw work from one source before merging (no provenance/library info yet). */
@@ -210,14 +223,23 @@ function sanitizeTitle(s: string): string {
 export interface SourceCheck {
   /** The bar's list it feeds (the Related tab is `related`). */
   list: 'references' | 'citations' | 'related';
+  /** The source asked. */
+  source: SourceName;
   /** e.g. "Crossref references". */
   name: string;
   /** Each request's HTTP status, in order. A request that got no answer adds none — see `error`. */
   statuses: number[];
   /** Why a request got no (readable) answer: offline, blocked, a bad answer. '' when none failed so. */
   error: string;
+  /** Stopped by the time limit; `error` then reads "no answer within N s". */
+  timedOut: boolean;
   /** Works this source gave. */
   count: number;
+  /** It has more works than it gave: it sends only its first page(s) — Semantic Scholar 1,000,
+   *  OpenAlex 600. */
+  more: boolean;
+  /** How many works it has, when it says (OpenAlex counts the works citing a paper). */
+  total?: number;
   /** How long its requests took, in ms (so far, while not `done`). */
   ms: number;
   /** False while it is still being asked. */
@@ -240,11 +262,31 @@ export function isTransientFailure(c: SourceCheck): boolean {
   return !!c.error || c.statuses.some((s) => s === 408 || s === 429 || s >= 500);
 }
 
-/** How a fetcher reports each request's status, or the error that stopped it — and the signal that
- *  stops its requests when the caller set a time limit (only the debug popup does). */
+/**
+ * Whether the Citations list is cut short: a source sent only its first works (Semantic Scholar
+ * 1,000, OpenAlex 600) and OpenCitations, the one source that sends them all, didn't make up for it —
+ * it ran out of time (a paper cited 200,000 times takes it minutes), failed, doesn't have the paper,
+ * or sent fewer than that source. undefined when the list is as complete as the sources make it.
+ */
+export function citationsCut(checks: SourceCheck[]): CitationsCut | undefined {
+  const cites = checks.filter((c) => c.list === 'citations');
+  const limited = cites.filter((c) => c.more).map((c) => ({ source: c.source, count: c.count }));
+  if (!limited.length) return undefined;
+  const oc = cites.find((c) => c.source === 'OpenCitations');
+  if (oc && sourceOutcome(oc) === 'answered' && oc.count >= Math.max(...limited.map((l) => l.count))) return undefined;
+  const total = cites.find((c) => c.source === 'OpenAlex' && c.total !== undefined)?.total;
+  return { total, limited, openCitations: oc };
+}
+
+/** How a fetcher reports each request's status, or the error that stopped it, and whether it sent
+ *  everything it has — and the signal that stops its requests (the time limit, or forgetSources). */
 interface Tracker {
   status(s: number): void;
   error(e: unknown): void;
+  /** How many works the source has, when it says. */
+  total(n: number): void;
+  /** The source has more works than it sent. */
+  more(): void;
   signal?: AbortSignal;
 }
 
@@ -329,7 +371,10 @@ async function s2List(doi: string, kind: 'references' | 'citations', t?: Tracker
     if (!res.ok) return [];
     const j = (await res.json()) as {
       data?: { citedPaper?: S2Paper; citingPaper?: S2Paper }[];
+      /** Where the next page starts — present only when there are more works than this page. */
+      next?: number | null;
     };
+    if (typeof j.next === 'number') t?.more();
     const nested = kind === 'references' ? 'citedPaper' : 'citingPaper';
     return (j.data ?? [])
       .map((row) => row?.[nested])
@@ -391,17 +436,21 @@ function oaToRaw(w: OAWork): RawPaper {
 }
 
 /** OpenAlex CITATIONS only (cited_by, paginated/capped). References come from Crossref alone now, so
- *  we no longer resolve OpenAlex's `referenced_works` (drops the batched ID-resolution fetches). */
+ *  we no longer resolve OpenAlex's `referenced_works` (drops the batched ID-resolution fetches).
+ *  OpenAlex lists the most-cited citing works first, and says how many there are (`meta.count`). */
 async function openAlexCitations(doi: string, t?: Tracker): Promise<RawPaper[]> {
   try {
-    const wRes = await fetch(`https://api.openalex.org/works/doi:${encodeDoiPath(doi)}?select=id`, jsonInit(t));
+    const wRes = await fetch(`https://api.openalex.org/works/doi:${encodeDoiPath(doi)}?select=id,cited_by_count`, jsonInit(t));
     t?.status(wRes.status);
     if (!wRes.ok) return [];
     const work = (await wRes.json()) as OAWork;
     const oaId = (work.id ?? '').split('/').pop() ?? ''; // "https://openalex.org/W123" → "W123"
     if (!oaId) return [];
+    // How many works cite it: the listing's own count when it gives one, else the work's figure.
+    let total = typeof work.cited_by_count === 'number' ? work.cited_by_count : undefined;
 
     const citations: RawPaper[] = [];
+    let lastPageFull = false;
     for (let page = 1; page <= OPENALEX_CITES_MAX_PAGES; page += 1) {
       const r = await fetch(
         `https://api.openalex.org/works?filter=cites:${oaId}&select=id,doi,title,publication_year,authorships,cited_by_count,primary_location,abstract_inverted_index&per-page=${OPENALEX_CITES_PAGE}&page=${page}`,
@@ -409,11 +458,15 @@ async function openAlexCitations(doi: string, t?: Tracker): Promise<RawPaper[]> 
       );
       t?.status(r.status);
       if (!r.ok) break;
-      const jr = (await r.json()) as { results?: OAWork[] };
+      const jr = (await r.json()) as { results?: OAWork[]; meta?: { count?: number | null } };
+      if (page === 1 && typeof jr.meta?.count === 'number') total = jr.meta.count;
       const rows = jr.results ?? [];
       for (const w of rows) citations.push(oaToRaw(w));
-      if (rows.length < OPENALEX_CITES_PAGE) break;
+      lastPageFull = rows.length >= OPENALEX_CITES_PAGE;
+      if (!lastPageFull) break;
     }
+    if (total !== undefined) t?.total(total);
+    if (total !== undefined ? total > citations.length : lastPageFull) t?.more();
     return citations;
   } catch (e) {
     t?.error(e);
@@ -607,15 +660,17 @@ function mergeUnique(
 
 // ───────────────────────── Metadata backfill (enrichment) ─────────────────────────
 
-const ENRICH_FALLBACK_MAX = 40; // cap the per-DOI Crossref / batched S2 fallback (OpenAlex batch is uncapped).
+const ENRICH_FALLBACK_MAX = 40; // cap the per-DOI Crossref / batched S2 fallback.
 const S2_BATCH = 100; // Semantic Scholar /paper/batch page size.
+const OPENALEX_CONCURRENCY = 3; // OpenAlex batches asked at once while filling in details.
 
-/** One OpenAlex request per 50 DOIs: `filter=doi:A|B|…` → DOI → full metadata. */
+/** One OpenAlex request per 50 DOIs (`filter=doi:A|B|…`), three at a time → DOI → full metadata. */
 async function openAlexByDois(dois: string[], signal?: AbortSignal): Promise<Map<string, RawPaper>> {
   const out = new Map<string, RawPaper>();
-  for (let i = 0; i < dois.length; i += OPENALEX_RESOLVE_BATCH) {
-    if (signal?.aborted) break; // the lookup was started again (forgetSources): stop here
-    const batch = dois.slice(i, i + OPENALEX_RESOLVE_BATCH);
+  const batches: string[][] = [];
+  for (let i = 0; i < dois.length; i += OPENALEX_RESOLVE_BATCH) batches.push(dois.slice(i, i + OPENALEX_RESOLVE_BATCH));
+  await runCapped(batches, OPENALEX_CONCURRENCY, async (batch) => {
+    if (signal?.aborted) return; // stopped (the time limit, or forgetSources): ask nothing more
     try {
       const r = await fetch(
         `https://api.openalex.org/works?filter=doi:${batch
@@ -623,7 +678,7 @@ async function openAlexByDois(dois: string[], signal?: AbortSignal): Promise<Map
           .join('|')}&select=id,doi,title,publication_year,authorships,cited_by_count,primary_location,abstract_inverted_index&per-page=${OPENALEX_RESOLVE_BATCH}`,
         { headers: { Accept: 'application/json' }, signal }
       );
-      if (!r.ok) continue;
+      if (!r.ok) return;
       const jr = (await r.json()) as { results?: OAWork[] };
       for (const w of jr.results ?? []) {
         const raw = oaToRaw(w);
@@ -632,7 +687,7 @@ async function openAlexByDois(dois: string[], signal?: AbortSignal): Promise<Map
     } catch {
       /* skip this batch */
     }
-  }
+  });
   return out;
 }
 
@@ -646,10 +701,11 @@ interface CrossrefWork {
 }
 
 /** Crossref single work by DOI → title/authors/year/venue (for the enrichment fallback). */
-async function crossrefWork(doi: string): Promise<Partial<RawPaper>> {
+async function crossrefWork(doi: string, signal?: AbortSignal): Promise<Partial<RawPaper>> {
   try {
     const res = await fetch(`https://api.crossref.org/works/${encodeDoiPath(doi)}`, {
       headers: { Accept: 'application/json' },
+      signal,
     });
     if (!res.ok) return {};
     const m = ((await res.json()) as { message?: CrossrefWork }).message;
@@ -670,9 +726,10 @@ async function crossrefWork(doi: string): Promise<Partial<RawPaper>> {
 }
 
 /** Semantic Scholar /paper/batch by DOI → title/authors/year/venue (one POST per 100 DOIs). */
-async function s2BatchWorks(dois: string[]): Promise<Map<string, Partial<RawPaper>>> {
+async function s2BatchWorks(dois: string[], signal?: AbortSignal): Promise<Map<string, Partial<RawPaper>>> {
   const out = new Map<string, Partial<RawPaper>>();
   for (let i = 0; i < dois.length; i += S2_BATCH) {
+    if (signal?.aborted) break;
     const batch = dois.slice(i, i + S2_BATCH);
     try {
       const res = await fetch(
@@ -681,6 +738,7 @@ async function s2BatchWorks(dois: string[]): Promise<Map<string, Partial<RawPape
           method: 'POST',
           headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
           body: JSON.stringify({ ids: batch.map((d) => `DOI:${d}`) }),
+          signal,
         }
       );
       if (!res.ok) continue;
@@ -718,12 +776,14 @@ async function runCapped<T>(items: T[], limit: number, fn: (x: T) => Promise<voi
 /**
  * Backfill any merged row that has a DOI but is missing its title, year, publication (venue) or
  * authors — common for Crossref reference entries (which frequently carry only a DOI), and for
- * OpenCitations-only citations (DOI-only). Tries OpenAlex first (one batched request covers the bulk
- * cheaply), then Crossref, then a batched Semantic Scholar lookup — each only for the fields STILL
- * missing, and stopping once nothing needs more. Mutates the rows in place; never throws. The per-DOI
- * Crossref/S2 fallback is capped (OpenAlex usually resolves nearly everything in one request).
+ * OpenCitations-only citations (DOI-only). Tries OpenAlex first (50 DOIs a request), then Crossref,
+ * then a batched Semantic Scholar lookup — each only for the fields STILL missing, and stopping once
+ * nothing needs more. An OpenAlex answer also gives a row with no citation count its count. Mutates the
+ * rows in place; never throws. Looks up at most `max` DOIs, the first in `papers`' order that need it
+ * (rowsByPriority gives the menu's order), and stops when `signal` aborts: a paper cited 200,000 times
+ * used to take ~3,900 OpenAlex requests here (R-047). The per-DOI Crossref/S2 fallback is capped too.
  */
-async function enrichMissing(papers: RelatedPaper[], signal?: AbortSignal): Promise<void> {
+async function enrichMissing(papers: RelatedPaper[], signal?: AbortSignal, max = Infinity): Promise<void> {
   const needs = (p: RelatedPaper): boolean =>
     !!p.doi && (!p.title || !p.year || !p.venue || !p.authors);
   const apply = (p: RelatedPaper, m: Partial<RawPaper>): void => {
@@ -732,37 +792,94 @@ async function enrichMissing(papers: RelatedPaper[], signal?: AbortSignal): Prom
     if (!p.venue && m.venue) p.venue = m.venue;
     if (!p.authors && m.authors) p.authors = m.authors;
     if (!p.abstract && m.abstract) p.abstract = m.abstract;
+    if (!p.citationCount && m.citationCount) p.citationCount = m.citationCount;
   };
-  const pendingDois = (): string[] => [...new Set(papers.filter(needs).map((p) => p.doi))];
-
-  if (pendingDois().length === 0) return;
-
-  // 1) OpenAlex — batched, uncapped (best DOI coverage; fills most rows in one request burst).
-  const oa = await openAlexByDois(pendingDois(), signal);
+  // A DOI can stand on several rows (a work both cited and citing, or in two lists): fill them all.
+  const rowsByDoi = new Map<string, RelatedPaper[]>();
   for (const p of papers) {
-    const m = oa.get(p.doi);
-    if (m && needs(p)) apply(p, m);
+    if (!p.doi) continue;
+    const rows = rowsByDoi.get(p.doi);
+    if (rows) rows.push(p);
+    else rowsByDoi.set(p.doi, [p]);
   }
+  const chosen: string[] = [];
+  const seen = new Set<string>();
+  for (const p of papers) {
+    if (chosen.length >= max) break;
+    if (needs(p) && !seen.has(p.doi)) {
+      seen.add(p.doi);
+      chosen.push(p.doi);
+    }
+  }
+  const pendingDois = (): string[] => chosen.filter((d) => (rowsByDoi.get(d) ?? []).some(needs));
+  const applyAll = (found: Map<string, Partial<RawPaper>>): void => {
+    for (const [d, m] of found) for (const p of rowsByDoi.get(d) ?? []) if (needs(p)) apply(p, m);
+  };
+
+  if (chosen.length === 0) return;
+
+  // 1) OpenAlex — 50 DOIs a request (best DOI coverage; fills most rows).
+  applyAll(await openAlexByDois(pendingDois(), signal));
   if (signal?.aborted) return;
 
   // 2) Crossref — single work per still-missing DOI (capped count + concurrency).
   const crDois = pendingDois().slice(0, ENRICH_FALLBACK_MAX);
   const cr = new Map<string, Partial<RawPaper>>();
   await runCapped(crDois, 6, async (doi) => {
-    cr.set(doi, await crossrefWork(doi));
+    if (signal?.aborted) return;
+    cr.set(doi, await crossrefWork(doi, signal));
   });
-  for (const p of papers) {
-    const m = cr.get(p.doi);
-    if (m && needs(p)) apply(p, m);
-  }
+  applyAll(cr);
   if (signal?.aborted) return;
 
   // 3) Semantic Scholar — batched, for anything STILL missing.
-  const s2 = await s2BatchWorks(pendingDois().slice(0, ENRICH_FALLBACK_MAX));
-  for (const p of papers) {
-    const m = s2.get(p.doi);
-    if (m && needs(p)) apply(p, m);
+  applyAll(await s2BatchWorks(pendingDois().slice(0, ENRICH_FALLBACK_MAX), signal));
+}
+
+/** How many works the on-page menu looks up details, scite tallies and metrics for (R-047). */
+export const DETAILS_MAX = 1000;
+
+/**
+ * A result's rows in the order the menu shows them first — what to look up first when a list is too
+ * long to look up whole: works in the library (the In Library tab), then references in the paper's
+ * order (the References tab), then related works and citations, each most-cited first (those tabs'
+ * default sort). A work in several lists appears more than once.
+ */
+export function rowsByPriority(r: Pick<MultiSourceResult, 'references' | 'citations' | 'relatedWorks'>): RelatedPaper[] {
+  const mostCited = (a: RelatedPaper, b: RelatedPaper): number =>
+    b.citationCount - a.citationCount || (Number(b.year) || 0) - (Number(a.year) || 0);
+  return [
+    ...[...r.references, ...r.citations, ...r.relatedWorks].filter((p) => p.inLibrary),
+    ...[...r.references].sort((a, b) => a.order - b.order),
+    ...[...r.relatedWorks].sort(mostCited),
+    ...[...r.citations].sort(mostCited),
+  ];
+}
+
+/** The DOIs to ask scite and the metrics about: the paper's own first, then its rows by priority —
+ *  deduped, at most `max`. */
+export function doisByPriority(
+  focusDoi: string,
+  r: Pick<MultiSourceResult, 'references' | 'citations' | 'relatedWorks'> | null,
+  max = DETAILS_MAX
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string): void => {
+    const d = normalizeDoi(raw);
+    if (d && !seen.has(d) && out.length < max) {
+      seen.add(d);
+      out.push(d);
+    }
+  };
+  add(focusDoi);
+  if (r) {
+    for (const p of rowsByPriority(r)) {
+      if (out.length >= max) break;
+      add(p.doi);
+    }
   }
+  return out;
 }
 
 // ───────────────────────── scite.ai Smart Citations ─────────────────────────
@@ -1155,9 +1272,16 @@ const lastChecks = new Map<string, { at: number; checks: SourceCheck[] }>();
  *  again, but a visit a minute later does. */
 const INCOMPLETE_KEEP_MS = 60_000;
 
+/** How long one source may take before it counts as "no answer" — in the on-page menu's lookup (since
+ *  R-047, 2026-11-25) and in the debug popup's. OpenCitations sends every citation in one answer: 3.4
+ *  minutes for a paper cited 200,000 times. */
+export const SOURCE_TIME_LIMIT_MS = 45_000;
+/** How long the menu's lookup spends filling in the works' details before it shows what it has. */
+export const ENRICH_TIME_LIMIT_MS = 30_000;
+
 type TaggedLists = { source: SourceName; papers: RawPaper[] }[];
 
-/** A time limit per source and a call after each change (the debug popup's own asking), and a signal
+/** A time limit per source, a call after each change (the debug popup's own asking), and a signal
  *  that stops every request (the menu's lookup, when forgetSources starts it again). */
 interface GatherOptions {
   timeoutMs?: number;
@@ -1168,12 +1292,24 @@ interface GatherOptions {
 /** Runs one source, recording how its requests went in `checks` (in call order). Never throws. */
 async function checked(
   list: SourceCheck['list'],
+  source: SourceName,
   name: string,
   checks: SourceCheck[],
   run: (t: Tracker) => Promise<RawPaper[]>,
   opts?: GatherOptions
 ): Promise<RawPaper[]> {
-  const check: SourceCheck = { list, name, statuses: [], error: '', count: 0, ms: 0, done: false };
+  const check: SourceCheck = {
+    list,
+    source,
+    name,
+    statuses: [],
+    error: '',
+    timedOut: false,
+    count: 0,
+    more: false,
+    ms: 0,
+    done: false,
+  };
   checks.push(check);
   opts?.onProgress?.(checks);
   const describe = (e: unknown): string => (e instanceof Error ? e.message || e.name : String(e));
@@ -1197,6 +1333,12 @@ async function checked(
       error: (e) => {
         check.error = describe(e);
       },
+      total: (n) => {
+        check.total = n;
+      },
+      more: () => {
+        check.more = true;
+      },
       signal: stop.signal,
     });
   } catch (e) {
@@ -1206,6 +1348,7 @@ async function checked(
   outer?.removeEventListener('abort', onOuterAbort);
   // Stopped (not merely finished as the stop came): say why instead of "aborted".
   if (stop.signal.aborted && check.error) {
+    check.timedOut = timedOut;
     check.error = timedOut ? `no answer within ${Math.round((opts?.timeoutMs ?? 0) / 1000)} s` : 'stopped — asked again';
   }
   check.count = papers.length;
@@ -1230,19 +1373,19 @@ async function gatherSources(
   opts?: GatherOptions
 ): Promise<{ refs: TaggedLists; cites: TaggedLists; related: TaggedLists }> {
   const [crRefs, s2Cites, oaCites, ocCites, oaRelated, s2Rec] = await Promise.all([
-    checked('references', 'Crossref references', checks, (t) => crossrefRefs(key, t), opts),
-    checked('citations', 'Semantic Scholar citations', checks, (t) => s2List(key, 'citations', t), opts),
-    checked('citations', 'OpenAlex citations', checks, (t) => openAlexCitations(key, t), opts),
-    checked('citations', 'OpenCitations citations', checks, (t) => openCitationsList(key, 'citations', t), opts),
-    checked('related', 'OpenAlex related works', checks, (t) => openAlexRelated(key, t), opts),
-    checked('related', 'Semantic Scholar recommendations', checks, (t) => s2Recommendations(key, t), opts),
+    checked('references', 'Crossref', 'Crossref references', checks, (t) => crossrefRefs(key, t), opts),
+    checked('citations', 'Semantic', 'Semantic Scholar citations', checks, (t) => s2List(key, 'citations', t), opts),
+    checked('citations', 'OpenAlex', 'OpenAlex citations', checks, (t) => openAlexCitations(key, t), opts),
+    checked('citations', 'OpenCitations', 'OpenCitations citations', checks, (t) => openCitationsList(key, 'citations', t), opts),
+    checked('related', 'OpenAlex', 'OpenAlex related works', checks, (t) => openAlexRelated(key, t), opts),
+    checked('related', 'Semantic', 'Semantic Scholar recommendations', checks, (t) => s2Recommendations(key, t), opts),
   ]);
   let refs: TaggedLists = [{ source: 'Crossref', papers: crRefs }];
   if (crRefs.length === 0 && !opts?.signal?.aborted) {
     const [s2Refs, oaRefs, ocRefs] = await Promise.all([
-      checked('references', 'Semantic Scholar references', checks, (t) => s2List(key, 'references', t), opts),
-      checked('references', 'OpenAlex references', checks, (t) => openAlexReferences(key, t), opts),
-      checked('references', 'OpenCitations references', checks, (t) => openCitationsList(key, 'references', t), opts),
+      checked('references', 'Semantic', 'Semantic Scholar references', checks, (t) => s2List(key, 'references', t), opts),
+      checked('references', 'OpenAlex', 'OpenAlex references', checks, (t) => openAlexReferences(key, t), opts),
+      checked('references', 'OpenCitations', 'OpenCitations references', checks, (t) => openCitationsList(key, 'references', t), opts),
     ]);
     refs = [
       { source: 'Semantic', papers: s2Refs },
@@ -1270,6 +1413,12 @@ async function gatherSources(
  * a server error) counts for INCOMPLETE_KEEP_MS only: that empty list is not "no data". Until 2026-11-24
  * a failed source's [] was cached as "no data" for the session. Two asks for one DOI share one lookup;
  * forgetSources stops it and the next ask starts afresh.
+ *
+ * Bounded since R-047 (2026-11-25): each source gets SOURCE_TIME_LIMIT_MS, the details lookup
+ * ENRICH_TIME_LIMIT_MS and at most DETAILS_MAX works. A paper cited ~200,000 times used to keep the
+ * bar on "…" for many minutes — OpenCitations sends every citation in one answer (3.4 minutes for PBE),
+ * then each was looked up. Such a paper now lists what Semantic Scholar and OpenAlex send, and
+ * `citationsCut` says the list is cut short.
  */
 export async function fetchAllSources(doi: string, plugin: RNPlugin): Promise<MultiSourceResult | null> {
   const key = normalizeDoi(doi);
@@ -1305,7 +1454,7 @@ async function loadAllSources(
 ): Promise<MultiSourceResult> {
   const checks: SourceCheck[] = [];
   const [{ refs, cites, related }, index] = await Promise.all([
-    gatherSources(key, checks, { signal }),
+    gatherSources(key, checks, { signal, timeoutMs: SOURCE_TIME_LIMIT_MS }),
     getLibraryDoiIndex(plugin).catch(() => new Map<string, LibDoc>()),
   ]);
   const references = mergeUnique(refs, index, key);
@@ -1314,8 +1463,20 @@ async function loadAllSources(
 
   // Backfill rows missing a title/year/publication/author (Crossref reference entries are usually
   // partial) by DOI — OpenAlex, then Crossref, then Semantic Scholar. Mutates in place BEFORE
-  // relatedFrom so the in-library "related" copies inherit the enriched metadata.
-  if (!signal.aborted) await enrichMissing([...references, ...citations, ...relatedWorks], signal);
+  // relatedFrom so the in-library "related" copies inherit the enriched metadata. At most DETAILS_MAX
+  // works, the ones the menu shows first, and for ENRICH_TIME_LIMIT_MS at most.
+  if (!signal.aborted) {
+    const stop = new AbortController();
+    const onAbort = (): void => stop.abort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    const timer = setTimeout(() => stop.abort(), ENRICH_TIME_LIMIT_MS);
+    try {
+      await enrichMissing(rowsByPriority({ references, citations, relatedWorks }), stop.signal, DETAILS_MAX);
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
 
   // NOTE: scite tallies are deliberately NOT fetched here — they're fetched separately in the widget
   // (off this cached/critical path) so (a) the bar/counts paint without waiting on scite, and (b) a
@@ -1325,6 +1486,7 @@ async function loadAllSources(
     citations,
     related: relatedFrom(references, citations),
     relatedWorks,
+    citationsCut: citationsCut(checks),
   };
   // Replaced by a newer lookup (forgetSources) while this one ran: leave the cache and the checks to it.
   if ((generation.get(key) ?? 0) !== gen) return result;
@@ -1370,7 +1532,11 @@ export function forgetSources(doi: string): void {
 export async function checkSources(
   doi: string,
   opts?: GatherOptions
-): Promise<{ checks: SourceCheck[]; counts: { references: number; citations: number; related: number } } | null> {
+): Promise<{
+  checks: SourceCheck[];
+  counts: { references: number; citations: number; related: number };
+  citationsCut?: CitationsCut;
+} | null> {
   const key = normalizeDoi(doi);
   if (!key) return null;
   const checks: SourceCheck[] = [];
@@ -1383,6 +1549,7 @@ export async function checkSources(
       citations: mergeUnique(cites, noLibrary, key).length,
       related: mergeUnique(related, noLibrary, key).length,
     },
+    citationsCut: citationsCut(checks),
   };
 }
 

@@ -25,16 +25,20 @@
  *    title — year · authors (sources), with an in-library ✓ link (navigates to the doc) or an Add button.
  *  - **Citations bar lists** — search/scope/sort, pagination, and the per-row **＋ Add** (Citoid →
  *    Zotero write → RemNote create) + bulk add are all wired (see "The citations bar").
+ *  - **Bounded for very widely cited papers** (R-047, 2026-11-25): the lookup gives each source 45 s and
+ *    fills in details, scite tallies and metrics for at most 1,000 works; a Citations list cut short
+ *    reads "1,523 of 226,173" on its tab, with the reason above the list.
  */
 import { renderWidget, usePlugin, useTrackerPlugin, WidgetLocation } from '@remnote/plugin-sdk';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { SESSION, SETTINGS, SLOTS, ZOTERO_ITEM_POWERUP } from '../lib/consts';
 import { BRAND_ICONS } from '../lib/brandIcons';
-import { failedSources, type MenuState, menuStateKey } from '../lib/citeDebug';
+import { citationsCutText, failedSources, type MenuState, menuStateKey } from '../lib/citeDebug';
 import { safeRichTextToString } from '../lib/notes';
 import { addRelatedItem, buildSyncContext, type SyncContext, syncSingleItem } from '../lib/sync';
 import { fetchItemByKey } from '../lib/zoteroApi';
 import {
+  doisByPriority,
   encodeDoiPath,
   fetchAllSources,
   fetchJournalMetric,
@@ -217,16 +221,21 @@ function BrandLink({ icon, name, href, disabled, size = 22 }: ExternalLink & { s
   );
 }
 
-/** Citations-bar button (each takes a third of the row, like zoteroRoam's flex 1 0 33%). */
+/** Citations-bar button (each takes a quarter of the row, like zoteroRoam's flex 1 0 33%). `of`: how
+ *  many works there are when the list is cut short ("1,523 of 226,173 Citations"); `title`: why. */
 function BarTab({
   count,
+  of,
   label,
+  title,
   active,
   disabled,
   onClick,
 }: {
   count: number | string;
+  of?: string;
   label: string;
+  title?: string;
   active: boolean;
   disabled?: boolean;
   onClick?: () => void;
@@ -236,6 +245,7 @@ function BarTab({
       type="button"
       disabled={disabled}
       onClick={onClick}
+      title={title}
       style={{
         flex: '1 1 0',
         paddingTop: 6,
@@ -244,7 +254,8 @@ function BarTab({
       }}
       className={`px-2 text-xs text-center ${disabled ? 'rn-clr-content-tertiary cursor-default' : 'cursor-pointer'}`}
     >
-      <span className={disabled ? '' : 'rn-clr-content-accent font-medium'}>{count}</span>{' '}
+      <span className={disabled ? '' : 'rn-clr-content-accent font-medium'}>{count}</span>
+      {of && <span className="rn-clr-content-tertiary"> of {of}</span>}{' '}
       <span className="rn-clr-content-secondary">{label}</span>
     </button>
   );
@@ -1149,13 +1160,10 @@ function ItemMenu() {
     }
     let cancelled = false;
     const res = sem.doi === doi ? sem.result : null;
-    const dois = [doi];
-    // ALL FOUR lists incl. relatedWorks — the Related tab is a first-class tab, and leaving it out of
-    // the batch left every row there with an empty metrics line and no journal value (so it scored -1
-    // in the journal-impact sort). `related` stays: it is the in-library subset, cheap to include.
-    if (res)
-      for (const p of [...res.references, ...res.citations, ...res.related, ...res.relatedWorks])
-        if (p.doi) dois.push(p.doi);
+    // The paper's own DOI first, then every list's rows (the Related tab's too — leaving it out once left
+    // its rows with no metrics line and no journal value) in the order the menu shows them first: at most
+    // DETAILS_MAX DOIs. A paper cited ~200,000 times used to send every DOI to scite and OpenAlex (R-047).
+    const dois = doisByPriority(doi, res);
     void fetchSciteTallies(dois).then((m) => {
       if (!cancelled) setSciteMap(m);
     });
@@ -1224,6 +1232,13 @@ function ItemMenu() {
     return out;
   }, [refs, cites, relatedWorks, justAdded]);
 
+  // A very widely cited paper's Citations list is cut short (R-047): how many works cite it (OpenAlex's
+  // count — from the lookup, else from the paper's own metrics) and why, in words, for the tab and the list.
+  const cut = semForDoc.result?.citationsCut;
+  const focusCitedBy = data?.doi ? metricsMap.get(normalizeDoi(data.doi))?.citedByCount : undefined;
+  const citeTotal = cut ? cut.total || focusCitedBy || undefined : undefined;
+  const cutNote = cut ? citationsCutText(cut, cites.length, citeTotal) : '';
+
   // What this menu shows on its page, for "Remzot: Debug Citations Bar" (another iframe) to read:
   // written whenever it changes. The "loading" state's `at` therefore says how long the menu has
   // been asking the sources.
@@ -1244,6 +1259,7 @@ function ItemMenu() {
         counts: { references: refs.length, inLibrary: inLibrary.length, citations: cites.length, related: relatedWorks.length },
         askedAt: semForDoc.checks?.at,
         failed: semForDoc.checks ? failedSources(semForDoc.checks.checks) : semForDoc.error ? [semForDoc.error] : [],
+        citationsCut: cut ? { total: citeTotal, note: cutNote, ocTimedOut: !!cut.openCitations?.timedOut } : undefined,
         navAt: tracked.navAt,
       };
   // `refreshed` only for this page's own request (answeredRefresh can belong to a page shown before).
@@ -1323,7 +1339,11 @@ function ItemMenu() {
   const pageStart = (safePage - 1) * pageSize;
   const shown = sorted.slice(pageStart, pageStart + pageSize);
   // Bar count text: '…' while loading, else the exact unique-union count.
-  const countText = (list: RelatedPaper[]): string => (semLoading ? '…' : String(list.length));
+  const countText = (list: RelatedPaper[]): string => (semLoading ? '…' : list.length.toLocaleString());
+  // Citations: "1,523 of 226,173" when the list is cut short and OpenAlex counts more works, "1,523+"
+  // when it is cut short otherwise (citationsCountText's rule, split for the tab's two colours).
+  const citesOf = !semLoading && cut && citeTotal && citeTotal > cites.length ? citeTotal.toLocaleString() : undefined;
+  const citesCount = `${countText(cites)}${!semLoading && cut && !citesOf ? '+' : ''}`;
 
   if (!data) return null;
 
@@ -1681,8 +1701,10 @@ function ItemMenu() {
               onClick={() => setOpenList((o) => (o === 'inlib' ? null : 'inlib'))}
             />
             <BarTab
-              count={countText(cites)}
+              count={citesCount}
+              of={citesOf}
               label="Citations"
+              title={cutNote || undefined}
               active={openList === 'cites'}
               disabled={semLoading || cites.length === 0}
               onClick={() => setOpenList((o) => (o === 'cites' ? null : 'cites'))}
@@ -1725,6 +1747,8 @@ function ItemMenu() {
               onToggleBulkPicker={() => onTogglePicker('bulk')}
               bulkBusy={bulkBusy}
             />
+            {/* Why a very widely cited paper's Citations list is cut short (R-047). */}
+            {openList === 'cites' && cutNote && <div className="mt-2 px-2 text-xs rn-clr-content-tertiary">{cutNote}</div>}
             {pickerFor === 'bulk' && (
               <CollectionPicker
                 collections={colls}

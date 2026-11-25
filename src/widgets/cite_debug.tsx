@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   answerText,
   type CheckState,
+  citationsCountText,
   clock,
   countMenus,
   doiAsWritten,
@@ -173,7 +174,10 @@ function CiteDebug() {
         onProgress: (checks) =>
           put({ sources: { doi: ask, shown, checks: checks.map((c) => ({ ...c, statuses: [...c.statuses] })), counts: null, startedAt } }),
       });
-      put({ sources: { doi: ask, shown, checks: res?.checks ?? [], counts: res?.counts ?? null, startedAt }, finished: true });
+      put({
+        sources: { doi: ask, shown, checks: res?.checks ?? [], counts: res?.counts ?? null, citationsCut: res?.citationsCut, startedAt },
+        finished: true,
+      });
     },
     [plugin]
   );
@@ -384,7 +388,7 @@ function CiteDebug() {
             {src.counts ? (
               <div style={{ marginTop: '0.4rem' }}>
                 The bar would show: References {src.counts.references.toLocaleString()} · Citations{' '}
-                {src.counts.citations.toLocaleString()} · Related {src.counts.related.toLocaleString()}{' '}
+                {citationsCountText(src.counts.citations, src.citationsCut)} · Related {src.counts.related.toLocaleString()}{' '}
                 <span className="rn-clr-content-secondary">
                   (In Library isn&apos;t counted here{ranOutOfTime(src.checks) ? '; a source that ran out of time counts as 0' : ''})
                 </span>

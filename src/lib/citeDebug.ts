@@ -5,8 +5,9 @@
  * The on-page menu's citations bar shows nothing, or zeros, in cases that look alike:
  *   - the menu read no DOI: the bar is hidden and the DOI-only links say "needs a DOI";
  *   - the item has no DOI at all, in RemNote or in Zotero;
- *   - a source failed (rate-limited, offline) or is still being asked — a very highly cited paper
- *     makes OpenCitations send every citation at once;
+ *   - a source failed (rate-limited, offline) or is still being asked;
+ *   - a very widely cited paper's Citations list is cut short: OpenCitations sends every citation at
+ *     once, which takes minutes, and the menu stops waiting after 45 s (R-047, 2026-11-25);
  *   - the sources really have nothing for the paper.
  * For the page open in the focused pane, the popup (widgets/cite_debug.tsx) shows:
  *   - the page: is it a Zotero item, and its key;
@@ -27,19 +28,31 @@ import {
   ZOTERO_ITEM_POWERUP,
 } from './consts';
 import { safeRichTextToString } from './notes';
-import { normalizeDoi, sourceOutcome, type SourceCheck } from './semantic';
+import {
+  type CitationsCut,
+  ENRICH_TIME_LIMIT_MS,
+  normalizeDoi,
+  SOURCE_TIME_LIMIT_MS,
+  type SourceCheck,
+  type SourceName,
+  sourceOutcome,
+} from './semantic';
 import { fetchItemByKey, parseDoiFromExtra } from './zoteroApi';
 
 export const DEBUG_COMMAND = 'Remzot: Debug Citations Bar';
 
-/** How long the popup lets one source take before calling it "no answer". */
-export const SOURCE_TIME_LIMIT_MS = 45_000;
+/** How long one source may take, here and in the on-page menu's lookup (semantic.ts). */
+export { SOURCE_TIME_LIMIT_MS };
 
 /** How long the popup waits for Zotero's copy of the item. */
 export const ZOTERO_TIME_LIMIT_MS = 20_000;
 
 /** How long after a page change the menu has to report on the page it now shows. */
 const MENU_REPORT_GRACE_MS = 5_000;
+
+/** How long the menu's lookup may take before the popup calls it too long: a source may take 45 s,
+ *  the reference fallback (asked when Crossref has no list) 45 s more, and the details 30 s. */
+const LOADING_PATIENCE_MS = 150_000;
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message || e.name : String(e));
 
@@ -69,6 +82,10 @@ export interface MenuState {
   askedAt?: number;
   /** Sources that failed in that ask, in words. */
   failed?: string[];
+  /** Set when the Citations list is cut short (semantic.ts `citationsCut`): how many works OpenAlex
+   *  counts as citing the paper, why the list is cut in words, and whether OpenCitations ran out of time
+   *  (expected for a paper cited this widely — asking again gives the same). */
+  citationsCut?: { total?: number; note: string; ocTimedOut: boolean };
   /** The Refresh (its `at`) this state answers, if any. */
   refreshed?: number;
   /** The page change (SESSION.navTick) the menu drew this for — every page change makes it write again. */
@@ -87,7 +104,7 @@ export function answerText(c: SourceCheck): string {
   if (outcome === 'not-found') return "doesn't have this paper (404)";
   if (c.error) {
     // Cut off by the time limit after the answer began: it was still coming in.
-    if (c.error.startsWith('no answer within') && c.statuses.some((s) => s >= 200 && s < 300)) {
+    if (c.timedOut && c.statuses.some((s) => s >= 200 && s < 300)) {
       return c.error.replace('no answer within', 'still sending after');
     }
     return c.error.startsWith('no answer') ? c.error : `no answer (${c.error})`;
@@ -115,8 +132,43 @@ export function duration(ms: number): string {
 
 const n = (x: number): string => x.toLocaleString();
 
-export const countsText = (c: ListCounts): string =>
-  `References ${n(c.references)} · In Library ${n(c.inLibrary)} · Citations ${n(c.citations)} · Related ${n(c.related)}`;
+/** The Citations count as the bar shows it: "1,523 of 226,173" when the list is cut short and OpenAlex
+ *  counts more works; "1,523+" when it is cut short otherwise; else "1,523". */
+export function citationsCountText(shown: number, cut?: { total?: number } | null): string {
+  if (!cut) return n(shown);
+  return cut.total && cut.total > shown ? `${n(shown)} of ${n(cut.total)}` : `${n(shown)}+`;
+}
+
+export const countsText = (c: ListCounts, cut?: { total?: number } | null): string =>
+  `References ${n(c.references)} · In Library ${n(c.inLibrary)} · Citations ${citationsCountText(c.citations, cut)} · Related ${n(c.related)}`;
+
+const SOURCE_LABEL: Record<SourceName, string> = {
+  Semantic: 'Semantic Scholar',
+  Crossref: 'Crossref',
+  OpenAlex: 'OpenAlex',
+  OpenCitations: 'OpenCitations',
+};
+
+/** Why a Citations list is cut short, in words — the menu shows it above the list and on its tab.
+ *  `total`: how many works cite the paper (OpenAlex's count; the menu may know it from elsewhere). */
+export function citationsCutText(cut: CitationsCut, shown: number, total = cut.total): string {
+  const head =
+    total && total > shown
+      ? `Showing ${n(shown)} of the ${n(total)} works that cite this paper (OpenAlex's count).`
+      : `Showing ${n(shown)} works that cite this paper; there are more.`;
+  const sent = cut.limited.map((l, i) => `${SOURCE_LABEL[l.source]} ${i === 0 ? 'sent its first' : 'its first'} ${n(l.count)}`);
+  const sentText = sent.length > 1 ? `${sent.slice(0, -1).join(', ')} and ${sent[sent.length - 1]}` : sent[0] ?? '';
+  const oc = cut.openCitations;
+  const ocText = !oc
+    ? ''
+    : sourceOutcome(oc) === 'not-found'
+    ? "OpenCitations, which sends them all, doesn't have this paper"
+    : sourceOutcome(oc) === 'answered'
+    ? `OpenCitations, which sends them all, has only ${n(oc.count)}`
+    : `OpenCitations, which sends them all, gave none — ${answerText(oc)}`;
+  const why = [sentText, ocText].filter(Boolean).join('; ');
+  return why ? `${head} ${why}.` : head;
+}
 
 // ───────────────────────── The checks ─────────────────────────
 
@@ -273,6 +325,8 @@ export interface SourcesInfo {
   checks: SourceCheck[];
   /** The lists the bar would hold (In Library aside); null while asking. */
   counts: { references: number; citations: number; related: number } | null;
+  /** Set when the Citations list would be cut short (see semantic.ts `citationsCut`). */
+  citationsCut?: CitationsCut;
   startedAt: number;
 }
 
@@ -480,48 +534,29 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
   }
 
   const src = s.sources;
-  const slow = (src?.checks ?? []).filter((c) => (!c.done && now - src!.startedAt > 15_000) || c.error.startsWith('no answer within'));
-  const huge = (src?.checks ?? []).find((c) => c.count > 10_000);
+  const slow = (src?.checks ?? []).filter((c) => (!c.done && now - src!.startedAt > 15_000) || c.timedOut);
   if (menu.bar === 'loading') {
+    // Since R-047 (2026-11-25) the menu's lookup is bounded: each source gets 45 s, the details 30 s.
     const waited = now - (menu.askingSince ?? menu.at);
-    if (waited < 60_000) {
-      return verdict('info', "The menu is still loading this paper's lists.", `For ${duration(waited)} so far.`, 'Wait a moment — this updates by itself.');
-    }
-    const title = `The menu has been loading this paper's lists for ${duration(waited)}.`;
-    if (huge) {
+    const bounds =
+      `it gives each source at most ${Math.round(SOURCE_TIME_LIMIT_MS / 1000)} s, ` +
+      `then the works' details ${Math.round(ENRICH_TIME_LIMIT_MS / 1000)} s more`;
+    if (waited < LOADING_PATIENCE_MS) {
       return verdict(
-        'warn',
-        title,
-        `${huge.name} sends all ${n(huge.count)} of its works for this paper in one answer, and the menu then looks up each ` +
-          "work's details — that takes far longer still.",
-        'Leave the page open: the bar fills in when the menu is done. Refresh would start it again from the beginning.'
+        'info',
+        "The menu is still loading this paper's lists.",
+        `For ${duration(waited)} so far — ${bounds}.`,
+        'Wait a moment — this updates by itself.'
       );
     }
-    if (slow.length) {
-      return verdict(
-        'warn',
-        title,
-        `Slow here too: ${slow.map((c) => `${c.name} (${c.done ? answerText(c) : `asking for ${duration(now - src!.startedAt)}`})`).join('; ')}.`,
-        'Press Refresh to ask again.',
-        true
-      );
-    }
-    if (!src?.counts) return verdict('warn', title, 'Asking the sources here, to see what is slow…');
-    const works = src.counts.references + src.counts.citations + src.counts.related;
-    if (works >= 3_000) {
-      return verdict(
-        'warn',
-        title,
-        `The sources answered here within seconds, with ${n(works)} works. The menu then looks up the details of each work ` +
-          'in batches, one after another — for this many, that takes minutes.',
-        'Leave the page open: the bar fills in when the menu is done.'
-      );
-    }
+    const slowHere = slow.length
+      ? ` Slow here too: ${slow.map((c) => `${c.name} (${c.done ? answerText(c) : `asking for ${duration(now - src!.startedAt)}`})`).join('; ')}.`
+      : '';
     return verdict(
       'warn',
-      title,
-      'The sources answered here within seconds. The menu may still be listing the papers in your library (once a session; ' +
-        'a big library takes a while), or it is stuck.',
+      `The menu has been loading this paper's lists for ${duration(waited)}.`,
+      `That is longer than it should take: ${bounds}. It may still be listing the papers in your library (once a session; ` +
+        `a big library takes a while), or it is stuck.${slowHere}`,
       'Wait a minute. If nothing changes, press Refresh.',
       true
     );
@@ -531,9 +566,22 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
   const c = menu.counts ?? { references: 0, inLibrary: 0, citations: 0, related: 0 };
   const menuTotal = c.references + c.citations + c.related;
   const failedThen = menu.failed ?? [];
+  const cut = menu.citationsCut;
+  // OpenCitations running out of time is what cuts a widely cited paper's Citations list short: asking
+  // again gives the same, so it isn't a failure to fix — the menu says why the list is cut.
+  const failedToFix = cut?.ocTimedOut ? failedThen.filter((f) => !f.startsWith('OpenCitations citations:')) : failedThen;
+  const fine = (): Verdict =>
+    cut
+      ? verdict(
+          'ok',
+          'The citations bar looks fine; its Citations list is cut short.',
+          `${cut.note} The menu shows ${countsText(c, cut)}.`,
+          'Nothing to fix. For every work that cites the paper, open it on OpenAlex — its link in the menu.'
+        )
+      : verdict('ok', 'The citations bar looks fine.', `The menu shows ${countsText(c)}.`);
   if (!src) return verdict('info', 'Checking…');
   if (!src.counts) {
-    if (menuTotal > 0 && !failedThen.length) return verdict('ok', 'The citations bar looks fine.', `The menu shows ${countsText(c)}.`);
+    if (menuTotal > 0 && !failedToFix.length) return fine();
     return verdict('info', 'Asking the sources…', slow.length ? `Still waiting for ${slow.map((x) => x.name).join(', ')}.` : '');
   }
   const fresh = src.counts;
@@ -593,24 +641,24 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
       true
     );
   }
-  if (failedThen.length) {
+  if (failedToFix.length) {
     return verdict(
       'info',
       'The bar shows works, but some sources failed when the menu asked.',
-      `${failedThen.join('; ')} — their share of the lists is missing.`,
+      `${failedToFix.join('; ')} — their share of the lists is missing.`,
       'Press Refresh to ask again.',
       true
     );
   }
-  return verdict('ok', 'The citations bar looks fine.', `The menu shows ${countsText(c)}.`);
+  return fine();
 }
 
 // ───────────────────────── The report, as text ─────────────────────────
 
 const ICON: Record<Level, string> = { ok: '✅', info: 'ℹ️', warn: '⚠️', error: '❌' };
 
-/** Whether any source was stopped by the popup's time limit (its works then count as 0). */
-export const ranOutOfTime = (checks: SourceCheck[]): boolean => checks.some((c) => c.error.startsWith('no answer within'));
+/** Whether any source was stopped by the time limit (its works then count as 0). */
+export const ranOutOfTime = (checks: SourceCheck[]): boolean => checks.some((c) => c.timedOut);
 
 /** How many times the menu is registered, in words. */
 export function menusText(n: number): string {
@@ -658,7 +706,7 @@ export function menuText(menu: MenuState | null | undefined): string {
   if (menu.missing === 'error') return `${when}: its read of the page failed (${menu.error || 'no reason given'}), so it showed nothing`;
   if (!menu.doi) return `${when}: read no DOI, so the citations bar is hidden`;
   if (menu.bar === 'loading') return `${when}: DOI ${menu.doi}; loading the lists since ${clock(menu.askingSince ?? menu.at)}`;
-  const counts = menu.counts ? countsText(menu.counts) : '';
+  const counts = menu.counts ? countsText(menu.counts, menu.citationsCut) : '';
   const failed = menu.failed?.length ? `; failed then: ${menu.failed.join('; ')}` : '';
   return `${when}: DOI ${menu.doi}; ${counts} (sources asked ${clock(menu.askedAt)}${failed})`;
 }
@@ -695,7 +743,7 @@ export function reportText(s: CheckState, menu: MenuState | null | undefined, v:
     }
     if (src.counts) {
       lines.push(
-        `  The bar would show: References ${n(src.counts.references)} · Citations ${n(src.counts.citations)} · Related ${n(src.counts.related)}` +
+        `  The bar would show: References ${n(src.counts.references)} · Citations ${citationsCountText(src.counts.citations, src.citationsCut)} · Related ${n(src.counts.related)}` +
           (ranOutOfTime(src.checks) ? ' (a source that ran out of time counts as 0 here)' : '')
       );
     }
