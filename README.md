@@ -73,9 +73,9 @@ On every synced item's page, below its properties, Remzot renders a quiet card w
   citation metrics and a one-click **Add to Zotero** (it lands in both Zotero and Remnote).
 
 For a very widely cited paper, the bar waits at most 45 s for each source and looks up details and metrics
-for the first 1,000 works. Its Citations tab may then read, say, *1,600 of 226,173 Citations*: the works the
-sources sent in time, out of OpenAlex's count, with the reason above the list. For every citing work, open
-the paper on OpenAlex.
+for its references, its related works and the first 1,000 works that cite it. When the Citations list holds
+fewer works than OpenAlex counts, its tab reads, say, *1,600 of 226,173 Citations*, with the reason above the
+list. For every citing work, open the paper on OpenAlex.
 
 When the item is also in [Incremental Everything](https://github.com/bjsi/incremental-everything), the
 card sits below its 📚 Inc Rems chip: if Remzot starts first, it moves its card down once that chip

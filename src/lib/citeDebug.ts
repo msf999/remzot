@@ -84,7 +84,7 @@ export interface MenuState {
   failed?: string[];
   /** Set when the Citations list is cut short (semantic.ts `citationsCut`): how many works OpenAlex
    *  counts as citing the paper, why the list is cut in words, and whether OpenCitations ran out of time
-   *  (expected for a paper cited this widely — asking again gives the same). */
+   *  (common for a paper cited this widely; asked again it may answer in time — its speed varies a lot). */
   citationsCut?: { total?: number; note: string; ocTimedOut: boolean };
   /** The Refresh (its `at`) this state answers, if any. */
   refreshed?: number;
@@ -567,8 +567,8 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
   const menuTotal = c.references + c.citations + c.related;
   const failedThen = menu.failed ?? [];
   const cut = menu.citationsCut;
-  // OpenCitations running out of time is what cuts a widely cited paper's Citations list short: asking
-  // again gives the same, so it isn't a failure to fix — the menu says why the list is cut.
+  // OpenCitations running out of time is what cuts a widely cited paper's Citations list short. It is
+  // not a failure to fix — the menu says why the list is cut — unless it answers in time now (below).
   const failedToFix = cut?.ocTimedOut ? failedThen.filter((f) => !f.startsWith('OpenCitations citations:')) : failedThen;
   const fine = (): Verdict =>
     cut
@@ -638,6 +638,21 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
       emptied.map(([name, , now2]) => `${name}: ${n(now2)} now`).join('; ') +
         (failedThen.length ? `. When the menu asked, these failed: ${failedThen.join('; ')}.` : '.'),
       'Press Refresh.',
+      true
+    );
+  }
+  // OpenCitations ran out of time when the menu asked, but answers now. Its speed varies a lot: PBE's
+  // 195,908 citations took 3.4 minutes once and 14 s another time. Until the 2026-11-25 review this said
+  // "Nothing to fix" while the popup itself had the longer list.
+  const ocNow = src.checks.find((x) => x.list === 'citations' && x.source === 'OpenCitations');
+  if (cut?.ocTimedOut && ocNow && sourceOutcome(ocNow) === 'answered' && fresh.citations > c.citations) {
+    return verdict(
+      'info',
+      'The menu cut its Citations list short, but OpenCitations sends the rest now.',
+      `When the menu asked (${clock(menu.askedAt)}), OpenCitations ran out of time, so the menu shows ` +
+        `${citationsCountText(c.citations, cut)} citations. Asked again now, it answered with ${n(ocNow.count)}: ` +
+        `the bar would show ${citationsCountText(fresh.citations, src.citationsCut)}.`,
+      'Press Refresh to load them.',
       true
     );
   }

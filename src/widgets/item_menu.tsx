@@ -1148,8 +1148,11 @@ function ItemMenu() {
   }, [doi, plugin, askTick]);
 
   // scite tallies (focus + rows) AND importance metrics (rows) — batched/cached, OFF the bar's critical
-  // path. Re-runs when the doc changes (focus only, while the lists load) and again when `sem` resolves
-  // (now including the row DOIs); on revisit it retries any DOIs that failed before.
+  // path. Re-runs when the doc changes (focus only, while the lists load) and again when the lists arrive
+  // (now including the row DOIs); on revisit it retries any DOIs that failed before. Keyed on the lists
+  // themselves, not on `sem`: its "loading" step re-ran it with nothing new, sending the paper's own
+  // scite and journal requests twice (2026-11-25 review).
+  const semResult = sem.doi === doi ? sem.result ?? null : null;
   useEffect(() => {
     if (!doi) {
       setSciteMap(new Map());
@@ -1159,7 +1162,7 @@ function ItemMenu() {
       return;
     }
     let cancelled = false;
-    const res = sem.doi === doi ? sem.result : null;
+    const res = semResult;
     // The paper's own DOI first, then every list's rows (the Related tab's too — leaving it out once left
     // its rows with no metrics line and no journal value) in the order the menu shows them first: at most
     // DETAILS_MAX DOIs. A paper cited ~200,000 times used to send every DOI to scite and OpenAlex (R-047).
@@ -1186,7 +1189,7 @@ function ItemMenu() {
     return () => {
       cancelled = true;
     };
-  }, [doi, sem, plugin]);
+  }, [doi, semResult, plugin]);
 
   // Navigate to a related item's RemNote doc.
   const openRelated = async (remId: string): Promise<void> => {
@@ -1313,7 +1316,10 @@ function ItemMenu() {
         sortKey === 'year'
           ? Number(p.year) || 0
           : sortKey === 'citations'
-          ? p.citationCount
+          ? // The count the row shows (RelatedRow): OpenAlex's from the metrics when known, else the
+            // source's. Sorting by the source's alone put a row with 3 above one with 50,000 whose list
+            // gave none (2026-11-25 review).
+            metricsMap.get(normalizeDoi(p.doi ?? ''))?.citedByCount || p.citationCount
           : sortKey === 'journal'
           ? // -1 (not 0) for unknown so rows with no journal metric — no DOI, preprints, books —
             // sort BELOW a genuine 0-ish journal rather than mixing in with it.
@@ -1332,7 +1338,7 @@ function ItemMenu() {
       return a.title.localeCompare(b.title);
     });
     return arr;
-  }, [filtered, sortKey, sortDir, journalMap]);
+  }, [filtered, sortKey, sortDir, journalMap, metricsMap]);
 
   const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
   const safePage = Math.min(page, pageCount);
