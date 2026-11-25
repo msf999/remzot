@@ -41,6 +41,7 @@ import {
   doisByPriority,
   encodeDoiPath,
   fetchAllSources,
+  fetchFocusMetrics,
   fetchJournalMetric,
   fetchJournalMetrics,
   fetchPaperMetrics,
@@ -1195,6 +1196,22 @@ function ItemMenu() {
     };
   }, [doi, semResult, plugin]);
 
+  // The paper's own chips (⚠ Retracted, influential, ★ top %) from its own metrics, asked for as soon as
+  // the page opens — not only from the rows' batch, which took ~2 minutes on a widely cited paper (R-025).
+  // Tagged with its DOI, so a page shown before never lends this one its chips. Refresh (askTick) asks
+  // again: a complete answer comes from the cache; one cut short (a key just fixed) is asked afresh.
+  const [focusOwn, setFocusOwn] = useState<{ doi: string; m: PaperMetrics } | null>(null);
+  useEffect(() => {
+    if (!doi) return;
+    let cancelled = false;
+    void fetchFocusMetrics(doi).then((m) => {
+      if (!cancelled && m) setFocusOwn({ doi, m });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [doi, askTick]);
+
   // Navigate to a related item's RemNote doc.
   const openRelated = async (remId: string): Promise<void> => {
     const target = await plugin.rem.findOne(remId);
@@ -1588,8 +1605,20 @@ function ItemMenu() {
 
   // scite tally for the focus paper (the header pill) — undefined while loading / no scite record.
   const focusTally = data.doi ? sciteMap.get(normalizeDoi(data.doi)) : undefined;
-  // The focus paper's own importance metrics (already fetched — its DOI leads the metrics batch).
-  const focusMetrics = data.doi ? metricsMap.get(normalizeDoi(data.doi)) : undefined;
+  // The paper's own chips: its own lookup first (R-025) — asked for the paper alone, so a rows' batch that
+  // failed (it leaves zeros for every paper in it, this one included) can't hide them — with any gap filled
+  // from the rows' batch (e.g. Semantic Scholar refused the lookup but answered the batch).
+  const ownM = data.doi && focusOwn && focusOwn.doi === data.doi ? focusOwn.m : undefined;
+  const batchM = data.doi ? metricsMap.get(normalizeDoi(data.doi)) : undefined;
+  const focusMetrics: PaperMetrics | undefined =
+    ownM && batchM
+      ? {
+          ...batchM,
+          retracted: ownM.retracted || batchM.retracted,
+          topPercent: ownM.topPercent ?? batchM.topPercent,
+          influential: Math.max(ownM.influential, batchM.influential),
+        }
+      : ownM ?? batchM;
   // The always-visible external-link icons (brand logos). `icon` keys into BRAND_ICONS; no-DOI links
   // (Semantic Scholar / OpenAlex / Inciteful) fade in place.
   const brandLinks: ExternalLink[] = [

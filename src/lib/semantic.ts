@@ -351,6 +351,7 @@ function onOpenAlexKeyChange(): void {
   keyEpoch += 1;
   cache.clear();
   metricsCache.clear();
+  focusMetricsCache.clear();
   libraryWidsPromise = null;
 }
 
@@ -1324,6 +1325,86 @@ export async function fetchPaperMetrics(dois: string[], plugin: RNPlugin): Promi
     out.set(d, m);
   }
   return out;
+}
+
+/** The paper's own metrics, by DOI, from fetchFocusMetrics (without relatedInLibrary); null = neither
+ *  OpenAlex nor Semantic Scholar has the paper. */
+const focusMetricsCache = new Map<string, PaperMetrics | null>();
+/** A fetchFocusMetrics lookup under way, per DOI: two asks share it (A → B → A while A's is running). */
+const focusInflight = new Map<string, Promise<PaperMetrics | null>>();
+/** How long each of fetchFocusMetrics' two requests may take: a source that hangs can't hold the chips back. */
+const FOCUS_TIME_LIMIT_MS = 10_000;
+
+/** A signal that aborts after `ms`. */
+function timeLimit(ms: number): AbortSignal {
+  const stop = new AbortController();
+  setTimeout(() => stop.abort(), ms);
+  return stop.signal;
+}
+
+/**
+ * The paper's OWN metrics — ⚠ Retracted, influential, ★ top % — asked for on their own, so the menu's chips
+ * for the paper don't wait for every row's batch (R-025: ~2 minutes on a widely cited paper, whose batch
+ * covers ~1,100 DOIs). OpenAlex's single-work lookup (it costs nothing) and Semantic Scholar's single-paper
+ * one, each limited to FOCUS_TIME_LIMIT_MS. `relatedInLibrary` stays 0 — it isn't shown for the paper itself
+ * — so these go in their own cache, never in metricsCache: a row elsewhere still gets its full metrics. A full
+ * result already cached is used as it is. null when neither source has or gave the paper; never throws.
+ */
+export function fetchFocusMetrics(doi: string): Promise<PaperMetrics | null> {
+  const d = normalizeDoi(doi);
+  if (!d) return Promise.resolve(null);
+  const full = metricsCache.get(d);
+  if (full) return Promise.resolve(full);
+  if (focusMetricsCache.has(d)) return Promise.resolve(focusMetricsCache.get(d) ?? null);
+  const pending = focusInflight.get(d);
+  if (pending) return pending;
+  const run = lookupFocusMetrics(d).finally(() => focusInflight.delete(d));
+  focusInflight.set(d, run);
+  return run;
+}
+
+async function lookupFocusMetrics(d: string): Promise<PaperMetrics | null> {
+  const epoch = keyEpoch;
+  // A source's answer: its data (null when none), and whether it was definite — what it has, or a 404 "I
+  // don't have this paper" — rather than a failure or a time-out, which the next visit asks again.
+  const ask = async <T>(go: () => Promise<Response>): Promise<{ data: T | null; definite: boolean }> => {
+    try {
+      const r = await go();
+      if (r.ok) return { data: (await r.json()) as T, definite: true };
+      return { data: null, definite: r.status === 404 };
+    } catch {
+      return { data: null, definite: false };
+    }
+  };
+  const [oa, s2] = await Promise.all([
+    ask<OAMetricWork>(() =>
+      oaFetch(`https://api.openalex.org/works/doi:${encodeDoiPath(d)}?select=cited_by_count,is_retracted,citation_normalized_percentile`, {
+        headers: { Accept: 'application/json' },
+        signal: timeLimit(FOCUS_TIME_LIMIT_MS),
+      })
+    ),
+    ask<{ influentialCitationCount?: number | null }>(() =>
+      fetch(`https://api.semanticscholar.org/graph/v1/paper/DOI:${encodeDoiPath(d)}?fields=influentialCitationCount`, {
+        headers: { Accept: 'application/json' },
+        signal: timeLimit(FOCUS_TIME_LIMIT_MS),
+      })
+    ),
+  ]);
+  const pct = oa.data?.citation_normalized_percentile;
+  const m: PaperMetrics | null =
+    oa.data || s2.data
+      ? {
+          citedByCount: typeof oa.data?.cited_by_count === 'number' ? oa.data.cited_by_count : 0,
+          influential: s2.data?.influentialCitationCount ?? 0,
+          topPercent: pct?.is_in_top_1_percent ? 1 : pct?.is_in_top_10_percent ? 10 : null,
+          retracted: !!oa.data?.is_retracted,
+          relatedInLibrary: 0,
+        }
+      : null;
+  // Kept when both answers were definite (a 404 included: asking again won't change it) and the key didn't
+  // change meanwhile. A failure or a time-out is asked again on the next visit.
+  if (oa.definite && s2.definite && epoch === keyEpoch) focusMetricsCache.set(d, m);
+  return m;
 }
 
 // ───────────────────────── Journal metric (venue 2-yr mean citedness) ─────────────────────────
