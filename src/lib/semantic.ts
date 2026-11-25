@@ -259,9 +259,10 @@ export function sourceOutcome(c: SourceCheck): SourceOutcome {
   return 'failed';
 }
 
-/** A failure that may pass: no answer at all, rate-limited (429), timed out (408), a server error. */
+/** A failure that may pass: no answer at all, a refused key (401/403 — it can be fixed; R-050), rate-limited
+ *  (429), timed out (408), a server error. */
 export function isTransientFailure(c: SourceCheck): boolean {
-  return !!c.error || c.statuses.some((s) => s === 408 || s === 429 || s >= 500);
+  return !!c.error || c.statuses.some((s) => s === 401 || s === 403 || s === 408 || s === 429 || s >= 500);
 }
 
 /**
@@ -300,6 +301,166 @@ interface Tracker {
 
 /** A JSON request's options, with the tracker's signal (if any). */
 const jsonInit = (t?: Tracker): RequestInit => ({ headers: { Accept: 'application/json' }, signal: t?.signal });
+
+// ───────────────────────── OpenAlex: the user's API key, and its per-second limit ─────────────────────────
+//
+// OpenAlex meters its API (R-050, 2026-11-25). Without a key, every request draws on one free daily budget
+// ($0.10, about 1,000 requests) shared with everyone on the same IP address, at most 10 requests a second;
+// a free key has $1 a day of its own, at 30 a second. Every OpenAlex request goes through oaFetch, which
+// adds the key from Remzot's "OpenAlex API Key" setting as the `api_key` parameter (OpenAlex also takes an
+// Authorization header, but that would add a CORS preflight to every request), and waits out a refusal
+// for going over the per-second limit. Each frame that asks OpenAlex says where to read the key
+// (setOpenAlexKeySource) before its first request.
+
+type KeySource = () => Promise<string | null | undefined>;
+let keySource: KeySource | undefined;
+let keyGen = 0;
+/** The key last read ('' = none), and until when it counts. */
+let keyCache: { key: string; until: number } | undefined;
+let keyPending: Promise<string> | undefined;
+/** The key the last successful read gave (undefined before the first). A different one empties the caches. */
+let lastKey: string | undefined;
+/** Bumped when the key changes, so a lookup or metrics batch begun before that doesn't write the caches. */
+let keyEpoch = 0;
+/** How long one read of the setting counts: a changed key is used within this long (at once after Refresh). */
+const OPENALEX_KEY_TTL_MS = 30_000;
+/** A read that fails, or doesn't answer within KEY_READ_MAX_MS, counts as no key for this long only. */
+const KEY_FAIL_TTL_MS = 5_000;
+const KEY_READ_MAX_MS = 3_000;
+/** How often oaFetch asks again after a per-second refusal, and the longest wait it accepts. */
+const OPENALEX_RETRIES = 2;
+const OPENALEX_MAX_WAIT_MS = 5_000;
+
+/** Where this frame reads the OpenAlex API key from (Remzot's setting); undefined → no key. */
+export function setOpenAlexKeySource(source: KeySource | undefined): void {
+  keySource = source;
+  keyGen += 1;
+  keyCache = undefined;
+  keyPending = undefined;
+}
+
+/** Read the setting again on the next request — Refresh does, so a fixed key is used at once. */
+function forgetOpenAlexKey(): void {
+  keyCache = undefined;
+  keyPending = undefined;
+}
+
+/** The key changed. What this frame cached may hold OpenAlex's refusals of the old key (401) or of a used-up
+ *  budget, kept for the session: drop it, and keep anything begun before the change from writing its own. */
+function onOpenAlexKeyChange(): void {
+  keyEpoch += 1;
+  cache.clear();
+  metricsCache.clear();
+  libraryWidsPromise = null;
+}
+
+/** One read of the setting. Only the read still pending when it answers updates the cache. */
+function readOpenAlexKey(source: KeySource): Promise<string> {
+  const gen = keyGen;
+  const p: Promise<string> = Promise.resolve().then(async () => {
+    let key = '';
+    let ok = false;
+    try {
+      key = String((await source()) ?? '').trim();
+      ok = true;
+    } catch {
+      // an unreadable setting → no key, for a few seconds
+    }
+    if (gen === keyGen && keyPending === p) {
+      if (ok) {
+        if (lastKey !== undefined && key !== lastKey) onOpenAlexKeyChange();
+        lastKey = key;
+      }
+      keyCache = { key, until: Date.now() + (ok ? OPENALEX_KEY_TTL_MS : KEY_FAIL_TTL_MS) };
+      keyPending = undefined;
+    }
+    return key;
+  });
+  return p;
+}
+
+/** The OpenAlex API key ('' for none), read at most every OPENALEX_KEY_TTL_MS. A read that doesn't answer
+ *  within KEY_READ_MAX_MS counts as no key for KEY_FAIL_TTL_MS; `signal` ends the wait (an AbortError).
+ *  Never throws otherwise. */
+async function openAlexKey(signal?: AbortSignal | null): Promise<string> {
+  if (!keySource) return '';
+  if (keyCache && Date.now() < keyCache.until) return keyCache.key;
+  if (!keyPending) keyPending = readOpenAlexKey(keySource);
+  const pending = keyPending;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<string>((resolve) => {
+        timer = setTimeout(() => {
+          // The setting didn't answer in time: no key for a few seconds, then read it again.
+          if (keyPending === pending) {
+            keyPending = undefined;
+            keyCache = { key: '', until: Date.now() + KEY_FAIL_TTL_MS };
+          }
+          resolve('');
+        }, KEY_READ_MAX_MS);
+      }),
+      new Promise<string>((_, reject) => {
+        if (!signal) return;
+        onAbort = (): void => reject(new DOMException('The operation was aborted.', 'AbortError'));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+/** Resolves after `ms`; rejects with an AbortError as soon as `signal` aborts. */
+function abortableWait(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const aborted = (): DOMException => new DOMException('The operation was aborted.', 'AbortError');
+    if (signal?.aborted) return reject(aborted());
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(aborted());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** For a 429: how long OpenAlex asks to wait before trying again (ms), or undefined when trying again
+ *  won't help — the daily budget is used up, or the wait is long (a new account's first dollar). */
+async function retryWait(res: Response): Promise<number | undefined> {
+  let reason = '';
+  try {
+    reason = String(((await res.clone().json()) as { reason?: unknown })?.reason ?? '');
+  } catch {
+    // no JSON body: go by Retry-After alone
+  }
+  if (reason === 'daily_budget') return undefined;
+  const after = Number(res.headers.get('Retry-After'));
+  const ms = (Number.isFinite(after) && after > 0 ? after : 1) * 1000;
+  return ms <= OPENALEX_MAX_WAIT_MS ? ms : undefined;
+}
+
+/** fetch() for api.openalex.org: with the user's API key when one is set, and asked again (up to
+ *  OPENALEX_RETRIES times) after the wait OpenAlex gives when it refuses a request for going over its
+ *  per-second limit. Returns the last answer — a used-up daily budget comes back as its 429. */
+async function oaFetch(url: string, init?: RequestInit): Promise<Response> {
+  const key = await openAlexKey(init?.signal);
+  const full = key ? `${url}${url.includes('?') ? '&' : '?'}api_key=${encodeURIComponent(key)}` : url;
+  for (let attempt = 0; ; attempt += 1) {
+    const res = await fetch(full, init);
+    if (res.status !== 429 || attempt >= OPENALEX_RETRIES) return res;
+    const wait = await retryWait(res);
+    if (wait === undefined) return res;
+    await abortableWait(wait, init?.signal);
+  }
+}
 
 // ───────────────────────── Per-source fetchers (each catches → []) ─────────────────────────
 
@@ -454,7 +615,7 @@ async function openAlexCitations(doi: string, t?: Tracker): Promise<RawPaper[]> 
   // Every page answered, full, up to Remzot's page limit: OpenAlex stopped there, not at its end.
   let atPageLimit = false;
   try {
-    const wRes = await fetch(`https://api.openalex.org/works/doi:${encodeDoiPath(doi)}?select=id,cited_by_count`, jsonInit(t));
+    const wRes = await oaFetch(`https://api.openalex.org/works/doi:${encodeDoiPath(doi)}?select=id,cited_by_count`, jsonInit(t));
     t?.status(wRes.status);
     if (!wRes.ok) return [];
     const work = (await wRes.json()) as OAWork;
@@ -463,7 +624,7 @@ async function openAlexCitations(doi: string, t?: Tracker): Promise<RawPaper[]> 
     if (typeof work.cited_by_count === 'number') total = work.cited_by_count;
 
     for (let page = 1; page <= OPENALEX_CITES_MAX_PAGES; page += 1) {
-      const r = await fetch(
+      const r = await oaFetch(
         `https://api.openalex.org/works?filter=cites:${oaId}&select=id,doi,title,publication_year,authorships,cited_by_count,primary_location,abstract_inverted_index&per-page=${OPENALEX_CITES_PAGE}&page=${page}`,
         jsonInit(t)
       );
@@ -491,14 +652,14 @@ async function openAlexReferences(doi: string, t?: Tracker): Promise<RawPaper[]>
   // A batch that fails, or is stopped by the time limit, keeps the batches before it.
   const references: RawPaper[] = [];
   try {
-    const wRes = await fetch(`https://api.openalex.org/works/doi:${encodeDoiPath(doi)}?select=referenced_works`, jsonInit(t));
+    const wRes = await oaFetch(`https://api.openalex.org/works/doi:${encodeDoiPath(doi)}?select=referenced_works`, jsonInit(t));
     t?.status(wRes.status);
     if (!wRes.ok) return [];
     const work = (await wRes.json()) as OAWork;
     const refIds = (work.referenced_works ?? []).map((u) => u.split('/').pop() ?? '').filter(Boolean);
     for (let i = 0; i < refIds.length; i += OPENALEX_RESOLVE_BATCH) {
       const batch = refIds.slice(i, i + OPENALEX_RESOLVE_BATCH);
-      const r = await fetch(
+      const r = await oaFetch(
         `https://api.openalex.org/works?filter=openalex:${batch.join(
           '|'
         )}&select=id,doi,title,publication_year,authorships,cited_by_count,primary_location,abstract_inverted_index&per-page=${OPENALEX_RESOLVE_BATCH}`,
@@ -522,14 +683,14 @@ async function openAlexRelated(doi: string, t?: Tracker): Promise<RawPaper[]> {
   // A batch that fails, or is stopped by the time limit, keeps the batches before it.
   const out: RawPaper[] = [];
   try {
-    const wRes = await fetch(`https://api.openalex.org/works/doi:${encodeDoiPath(doi)}?select=related_works`, jsonInit(t));
+    const wRes = await oaFetch(`https://api.openalex.org/works/doi:${encodeDoiPath(doi)}?select=related_works`, jsonInit(t));
     t?.status(wRes.status);
     if (!wRes.ok) return [];
     const work = (await wRes.json()) as OAWork;
     const ids = (work.related_works ?? []).map((u) => u.split('/').pop() ?? '').filter(Boolean);
     for (let i = 0; i < ids.length; i += OPENALEX_RESOLVE_BATCH) {
       const batch = ids.slice(i, i + OPENALEX_RESOLVE_BATCH);
-      const r = await fetch(
+      const r = await oaFetch(
         `https://api.openalex.org/works?filter=openalex:${batch.join(
           '|'
         )}&select=id,doi,title,publication_year,authorships,cited_by_count,primary_location,abstract_inverted_index&per-page=${OPENALEX_RESOLVE_BATCH}`,
@@ -683,7 +844,7 @@ async function openAlexByDois(dois: string[], signal?: AbortSignal): Promise<Map
   await runCapped(batches, OPENALEX_CONCURRENCY, async (batch) => {
     if (signal?.aborted) return; // stopped (the time limit, or forgetSources): ask nothing more
     try {
-      const r = await fetch(
+      const r = await oaFetch(
         `https://api.openalex.org/works?filter=doi:${batch
           .map(encodeDoiPath)
           .join('|')}&select=id,doi,title,publication_year,authorships,cited_by_count,primary_location,abstract_inverted_index&per-page=${OPENALEX_RESOLVE_BATCH}`,
@@ -1008,49 +1169,61 @@ export interface PaperMetrics {
 
 const metricsCache = new Map<string, PaperMetrics>();
 const LIBRARY_WID_MAX_BATCHES = 12; // cap the library→OpenAlex-ID resolution (≤600 DOIs) for a huge KB.
-/** The library's OpenAlex work-IDs (resolved once/session from the DOI index) — for related_works ∩ lib. */
-let libraryWidsPromise: Promise<Set<string>> | null = null;
+/** The library's OpenAlex work-IDs (resolved once/session from the DOI index) — for related_works ∩ lib —
+ *  and whether every batch answered. */
+let libraryWidsPromise: Promise<{ wids: Set<string>; complete: boolean }> | null = null;
 
 function oaId(url: string | undefined | null): string {
   return (url ?? '').split('/').pop() ?? ''; // "https://openalex.org/W123" → "W123"
 }
 
-/** Resolve the user's library DOIs → OpenAlex work-IDs (batched, capped, cached once/session). A failed
- *  build is not cached (retries). */
-function getLibraryWids(plugin: RNPlugin): Promise<Set<string>> {
+/** Resolve the user's library DOIs → OpenAlex work-IDs (batched, capped, cached once/session). A build in
+ *  which a batch failed, or that a key change overtook, is used once and built again next time: until the
+ *  2026-11-25 review a refused key or a used-up budget left "↔ in your library" at 0 for the session. */
+function getLibraryWids(plugin: RNPlugin): Promise<{ wids: Set<string>; complete: boolean }> {
   if (!libraryWidsPromise) {
-    libraryWidsPromise = (async () => {
-      const wids = new Set<string>();
-      const index = await getLibraryDoiIndex(plugin);
-      const dois = [...index.keys()];
-      const maxDois = LIBRARY_WID_MAX_BATCHES * OPENALEX_RESOLVE_BATCH;
-      if (dois.length > maxDois) {
-        console.info(
-          `Remzot: library has ${dois.length} DOIs; resolving only the first ${maxDois} for "related in your library"`
-        );
-      }
-      for (let i = 0; i < Math.min(dois.length, maxDois); i += OPENALEX_RESOLVE_BATCH) {
-        const batch = dois.slice(i, i + OPENALEX_RESOLVE_BATCH);
-        try {
-          const r = await fetch(
-            `https://api.openalex.org/works?filter=doi:${batch.map(encodeDoiPath).join('|')}&select=id&per-page=${OPENALEX_RESOLVE_BATCH}`,
-            { headers: { Accept: 'application/json' } }
+    const epoch = keyEpoch;
+    const p: Promise<{ wids: Set<string>; complete: boolean }> = Promise.resolve()
+      .then(async () => {
+        const wids = new Set<string>();
+        let complete = true;
+        const index = await getLibraryDoiIndex(plugin);
+        const dois = [...index.keys()];
+        const maxDois = LIBRARY_WID_MAX_BATCHES * OPENALEX_RESOLVE_BATCH;
+        if (dois.length > maxDois) {
+          console.info(
+            `Remzot: library has ${dois.length} DOIs; resolving only the first ${maxDois} for "related in your library"`
           );
-          if (!r.ok) continue;
-          const jr = (await r.json()) as { results?: { id?: string }[] };
-          for (const w of jr.results ?? []) {
-            const id = oaId(w.id);
-            if (id) wids.add(id);
-          }
-        } catch {
-          /* skip this batch */
         }
-      }
-      return wids;
-    })().catch(() => {
-      libraryWidsPromise = null; // don't cache a hard failure
-      return new Set<string>();
-    });
+        for (let i = 0; i < Math.min(dois.length, maxDois); i += OPENALEX_RESOLVE_BATCH) {
+          const batch = dois.slice(i, i + OPENALEX_RESOLVE_BATCH);
+          try {
+            const r = await oaFetch(
+              `https://api.openalex.org/works?filter=doi:${batch.map(encodeDoiPath).join('|')}&select=id&per-page=${OPENALEX_RESOLVE_BATCH}`,
+              { headers: { Accept: 'application/json' } }
+            );
+            if (!r.ok) {
+              complete = false;
+              continue;
+            }
+            const jr = (await r.json()) as { results?: { id?: string }[] };
+            for (const w of jr.results ?? []) {
+              const id = oaId(w.id);
+              if (id) wids.add(id);
+            }
+          } catch {
+            complete = false; // skip this batch
+          }
+        }
+        if (epoch !== keyEpoch) complete = false;
+        if (!complete && libraryWidsPromise === p) libraryWidsPromise = null;
+        return { wids, complete };
+      })
+      .catch(() => {
+        if (libraryWidsPromise === p) libraryWidsPromise = null; // don't cache a hard failure
+        return { wids: new Set<string>(), complete: false };
+      });
+    libraryWidsPromise = p;
   }
   return libraryWidsPromise;
 }
@@ -1066,7 +1239,10 @@ interface OAMetricWork {
 /** Fetch importance metrics (influential cites + top-percentile + retracted + related-in-library) for the
  *  given DOIs: OpenAlex batch (percentile / retracted / related_works) + Semantic Scholar batch
  *  (influentialCitationCount) + the library W-ID set for the related_works intersection. Batched + cached
- *  per DOI; never throws (missing signals just read as 0/false/null). Result keyed by normalized DOI. */
+ *  per DOI; never throws (missing signals just read as 0/false/null). Result keyed by normalized DOI.
+ *  A DOI whose batch failed — or whose library set is incomplete, or that a key change overtook — is
+ *  returned but not cached, so the next visit asks again: until the 2026-11-25 review a refused key or a
+ *  used-up budget cached zeros (and no "Retracted") for the session. */
 export async function fetchPaperMetrics(dois: string[], plugin: RNPlugin): Promise<Map<string, PaperMetrics>> {
   const out = new Map<string, PaperMetrics>();
   const need: string[] = [];
@@ -1078,27 +1254,34 @@ export async function fetchPaperMetrics(dois: string[], plugin: RNPlugin): Promi
     else if (!metricsCache.has(d) && !need.includes(d)) need.push(d);
   }
   if (!need.length) return out;
-  const libWids = await getLibraryWids(plugin).catch(() => new Set<string>());
+  const epoch = keyEpoch;
+  const lib = await getLibraryWids(plugin).catch(() => ({ wids: new Set<string>(), complete: false }));
+  const libWids = lib.wids;
+  /** DOIs whose OpenAlex or Semantic Scholar batch failed: returned, not cached. */
+  const unsure = new Set<string>();
 
   // OpenAlex: percentile / retracted / related_works (batched by DOI).
   const oa = new Map<string, OAMetricWork>();
   for (let i = 0; i < need.length; i += OPENALEX_RESOLVE_BATCH) {
     const batch = need.slice(i, i + OPENALEX_RESOLVE_BATCH);
     try {
-      const r = await fetch(
+      const r = await oaFetch(
         `https://api.openalex.org/works?filter=doi:${batch
           .map(encodeDoiPath)
           .join('|')}&select=doi,cited_by_count,is_retracted,citation_normalized_percentile,related_works&per-page=${OPENALEX_RESOLVE_BATCH}`,
         { headers: { Accept: 'application/json' } }
       );
-      if (!r.ok) continue;
+      if (!r.ok) {
+        for (const d of batch) unsure.add(d);
+        continue;
+      }
       const jr = (await r.json()) as { results?: OAMetricWork[] };
       for (const w of jr.results ?? []) {
         const d = normalizeDoi(w.doi);
         if (d) oa.set(d, w);
       }
     } catch {
-      /* skip this batch */
+      for (const d of batch) unsure.add(d); // skip this batch
     }
   }
 
@@ -1112,16 +1295,20 @@ export async function fetchPaperMetrics(dois: string[], plugin: RNPlugin): Promi
         headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: batch.map((d) => `DOI:${d}`) }),
       });
-      if (!res.ok) continue;
+      if (!res.ok) {
+        for (const d of batch) unsure.add(d);
+        continue;
+      }
       const arr = (await res.json()) as ({ influentialCitationCount?: number } | null)[];
       arr.forEach((p, idx) => {
         if (p) inf.set(batch[idx], p.influentialCitationCount ?? 0);
       });
     } catch {
-      /* skip this batch */
+      for (const d of batch) unsure.add(d); // skip this batch
     }
   }
 
+  const cacheable = lib.complete && epoch === keyEpoch;
   for (const d of need) {
     const w = oa.get(d);
     const pct = w?.citation_normalized_percentile;
@@ -1133,7 +1320,7 @@ export async function fetchPaperMetrics(dois: string[], plugin: RNPlugin): Promi
       retracted: !!w?.is_retracted,
       relatedInLibrary: libWids.size ? related.reduce((n, u) => n + (libWids.has(oaId(u)) ? 1 : 0), 0) : 0,
     };
-    metricsCache.set(d, m);
+    if (cacheable && !unsure.has(d)) metricsCache.set(d, m);
     out.set(d, m);
   }
   return out;
@@ -1178,7 +1365,7 @@ export async function fetchJournalMetrics(dois: string[]): Promise<Map<string, J
   for (let i = 0; i < missing.length; i += JOURNAL_BATCH) {
     const batch = missing.slice(i, i + JOURNAL_BATCH);
     try {
-      const r = await fetch(
+      const r = await oaFetch(
         `https://api.openalex.org/works?filter=doi:${batch.map(encodeDoiPath).join('|')}` +
           `&select=doi,primary_location&per-page=${JOURNAL_BATCH}`,
         { headers: { Accept: 'application/json' } }
@@ -1210,7 +1397,7 @@ export async function fetchJournalMetrics(dois: string[]): Promise<Map<string, J
   for (let i = 0; i < need.length; i += JOURNAL_BATCH) {
     const batch = need.slice(i, i + JOURNAL_BATCH);
     try {
-      const r = await fetch(
+      const r = await oaFetch(
         `https://api.openalex.org/sources?filter=ids.openalex:${batch.join('|')}` +
           `&select=id,display_name,summary_stats&per-page=${JOURNAL_BATCH}`,
         { headers: { Accept: 'application/json' } }
@@ -1259,7 +1446,7 @@ export async function fetchJournalMetric(doi: string): Promise<JournalMetric | n
     // 1) doi → source id (cached, incl. '' = no source).
     let sid = sourceIdByDoi.get(d);
     if (sid === undefined) {
-      const wr = await fetch(`https://api.openalex.org/works/doi:${encodeDoiPath(d)}?select=primary_location`, {
+      const wr = await oaFetch(`https://api.openalex.org/works/doi:${encodeDoiPath(d)}?select=primary_location`, {
         headers: { Accept: 'application/json' },
       });
       if (!wr.ok) return null; // transient — don't cache.
@@ -1271,7 +1458,7 @@ export async function fetchJournalMetric(doi: string): Promise<JournalMetric | n
 
     // 2) source id → metric (cached, incl. null = no usable stat).
     if (journalMetricBySource.has(sid)) return journalMetricBySource.get(sid) ?? null;
-    const sr = await fetch(`https://api.openalex.org/sources/${sid}?select=display_name,summary_stats`, {
+    const sr = await oaFetch(`https://api.openalex.org/sources/${sid}?select=display_name,summary_stats`, {
       headers: { Accept: 'application/json' },
     });
     if (!sr.ok) return null; // transient — don't cache.
@@ -1487,6 +1674,7 @@ async function loadAllSources(
   signal: AbortSignal
 ): Promise<MultiSourceResult> {
   const checks: SourceCheck[] = [];
+  const epoch = keyEpoch;
   const [{ refs, cites, related }, index] = await Promise.all([
     gatherSources(key, checks, { signal, timeoutMs: SOURCE_TIME_LIMIT_MS }),
     getLibraryDoiIndex(plugin).catch(() => new Map<string, LibDoc>()),
@@ -1524,8 +1712,9 @@ async function loadAllSources(
     relatedWorks,
     citationsCut: citationsCut(checks, citations.length),
   };
-  // Replaced by a newer lookup (forgetSources) while this one ran: leave the cache and the checks to it.
-  if ((generation.get(key) ?? 0) !== gen) return result;
+  // Replaced by a newer lookup (forgetSources) while this one ran — or the OpenAlex key changed, so its
+  // OpenAlex share may be the old key's refusal: leave the cache and the checks to the next lookup.
+  if ((generation.get(key) ?? 0) !== gen || epoch !== keyEpoch) return result;
   lastChecks.set(key, { at: startedAt, checks });
   // A list that has works keeps them even if one of its sources failed: asking again for that share
   // isn't worth a full burst of requests on every visit.
@@ -1556,6 +1745,8 @@ export function forgetSources(doi: string): void {
     load.stop.abort();
   }
   generation.set(key, (generation.get(key) ?? 0) + 1);
+  // Asking again reads the OpenAlex key setting again too, so a key just fixed is used (R-050).
+  forgetOpenAlexKey();
 }
 
 /**

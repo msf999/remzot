@@ -19,6 +19,7 @@ import {
   menusText,
   menuStateKey,
   menuText,
+  openAlexKeyText,
   readDoi,
   ranOutOfTime,
   readPage,
@@ -28,8 +29,8 @@ import {
   verdictFor,
   zoteroText,
 } from '../lib/citeDebug';
-import { SESSION } from '../lib/consts';
-import { checkSources, sourceOutcome, type SourceCheck } from '../lib/semantic';
+import { SESSION, SETTINGS } from '../lib/consts';
+import { checkSources, setOpenAlexKeySource, sourceOutcome, type SourceCheck } from '../lib/semantic';
 
 /** Copy text to the clipboard, falling back to a hidden textarea + execCommand. */
 async function copyToClipboard(text: string): Promise<boolean> {
@@ -111,6 +112,8 @@ function SourceRow({ c, now, startedAt }: { c: SourceCheck; now: number; started
 
 function CiteDebug() {
   const plugin = usePlugin();
+  // This popup's own OpenAlex requests carry the API key from Remzot's settings, as the menu's do (R-050).
+  useState(() => setOpenAlexKeySource(() => plugin.settings.getSetting<string>(SETTINGS.openAlexKey)));
   const [docId, setDocId] = useState('');
   const [state, setState] = useState<CheckState | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -167,6 +170,8 @@ function CiteDebug() {
       const ask = doiToAsk(doi);
       if (!ask) return put({ finished: true });
       const shown = doiAsWritten(doi);
+      const key = await plugin.settings.getSetting<string>(SETTINGS.openAlexKey).catch(() => undefined);
+      put({ openAlexKey: !!String(key ?? '').trim() });
       const startedAt = Date.now();
       put({ sources: { doi: ask, shown, checks: [], counts: null, startedAt } });
       const res = await checkSources(ask, {
@@ -370,6 +375,11 @@ function CiteDebug() {
             <div className="font-semibold" style={{ marginBottom: '0.25rem' }}>
               The sources, asked now about {src.shown || src.doi} ({clock(src.startedAt)})
             </div>
+            {state?.openAlexKey !== undefined && (
+              <div className="rn-clr-content-secondary" style={{ marginBottom: '0.25rem' }}>
+                OpenAlex asked {openAlexKeyText(state.openAlexKey)}.
+              </div>
+            )}
             <table style={{ borderCollapse: 'collapse' }}>
               <thead>
                 <tr className="rn-clr-content-secondary">

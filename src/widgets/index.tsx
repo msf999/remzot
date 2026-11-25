@@ -45,6 +45,16 @@ async function onActivate(plugin: ReactRNPlugin) {
       'Your zotero.org username slug (zotero.org/<username>) — used to build "Open in Zotero ' +
       '[Web library]" links on item pages. Numeric-ID links do not work on zotero.org.',
   });
+
+  // --- Setting: OpenAlex API key (optional; R-050, 2026-11-25) ---
+  await plugin.settings.registerStringSetting({
+    id: SETTINGS.openAlexKey,
+    title: 'OpenAlex API Key (optional)',
+    description:
+      "Without a key, OpenAlex shares one small free daily budget among everyone on your network's IP " +
+      'address, and the citations bar can run out of it. A free key, made at https://openalex.org/settings/api, ' +
+      'has a daily budget of its own; Remzot sends it with every OpenAlex request. Leave empty to ask without one.',
+  });
   await plugin.settings.registerBooleanSetting({
     id: SETTINGS.initIncremental,
     title: 'Make new items Incremental (Incremental Everything)',

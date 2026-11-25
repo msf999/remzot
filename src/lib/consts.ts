@@ -9,6 +9,9 @@ export const SETTINGS = {
   /** When ON, every item the plugin CREATES (on-page Add + global-sync create) is also made an
    *  Incremental Everything "incremental rem". No-ops gracefully if IE isn't installed. */
   initIncremental: 'init-incremental-on-create',
+  /** Optional OpenAlex API key (R-050, 2026-11-25): sent with every OpenAlex request. Without one,
+   *  OpenAlex gives everyone on the same IP address one shared free daily budget. */
+  openAlexKey: 'openalex-api-key',
 } as const;
 
 /**

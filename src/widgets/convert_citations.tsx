@@ -17,7 +17,7 @@ import {
 } from '../lib/citeConvert';
 import { SESSION, SETTINGS } from '../lib/consts';
 import { SyncLog } from '../lib/log';
-import { fetchNumberedReferences, type NumberedRef, type NumberedRefList } from '../lib/semantic';
+import { fetchNumberedReferences, type NumberedRef, type NumberedRefList, setOpenAlexKeySource } from '../lib/semantic';
 import { buildSyncContext, type SyncContext } from '../lib/sync';
 import { fetchItemByKey, findZoteroItemByDoi } from '../lib/zoteroApi';
 
@@ -86,6 +86,8 @@ const WARNING = 'var(--rn-clr-content-warning, #b45309)';
 
 export const ConvertCitations = () => {
   const plugin = usePlugin();
+  // OpenAlex requests (the reference list's details) carry the API key from Remzot's settings (R-050).
+  useState(() => setOpenAlexKeySource(() => plugin.settings.getSetting<string>(SETTINGS.openAlexKey)));
   const [phase, setPhase] = useState<Phase>('loading');
   const [stage, setStage] = useState('Reading the rems…');
   const [paper, setPaper] = useState<PaperInfo | null>(null);

@@ -54,6 +54,7 @@ import {
   registerAddedItem,
   type RelatedPaper,
   type SciteTally,
+  setOpenAlexKeySource,
   sourcesAskedSince,
   type SourceCheck,
 } from '../lib/semantic';
@@ -944,6 +945,9 @@ const SEM_IDLE: SemState = { status: 'idle', doi: '', result: null };
 
 function ItemMenu() {
   const plugin = usePlugin();
+  // OpenAlex requests carry the API key from Remzot's settings (R-050). Set on the first render, before
+  // any effect asks OpenAlex anything.
+  useState(() => setOpenAlexKeySource(() => plugin.settings.getSetting<string>(SETTINGS.openAlexKey)));
   // At most ONE of the three lists is open at a time (clicking another switches to it).
   const [openList, setOpenList] = useState<'refs' | 'inlib' | 'cites' | 'related' | null>(null);
   const [syncing, setSyncing] = useState(false);

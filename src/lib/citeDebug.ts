@@ -339,7 +339,39 @@ export interface CheckState {
   doi?: DoiInfo;
   /** Undefined until asked — and when no DOI could be found anywhere. */
   sources?: SourcesInfo;
+  /** Whether Remzot's "OpenAlex API Key" setting holds a key (R-050); undefined until read. */
+  openAlexKey?: boolean;
   finished: boolean;
+}
+
+/** How OpenAlex was asked (R-050): with the key from Remzot's settings, or without one. */
+export function openAlexKeyText(keySet: boolean | undefined): string {
+  if (keySet === undefined) return '';
+  return keySet
+    ? "with the API key in Remzot's settings"
+    : "without a key — one small free daily budget, shared with everyone on your network's IP address";
+}
+
+/**
+ * What to do when OpenAlex refused requests (R-050): its answer to a bad key (401, or 403 for one not
+ * yet activated), or to a used-up daily budget (429 — a refusal for going over its per-second limit is
+ * asked again before it counts). '' when no OpenAlex source is among `failures` ("OpenAlex citations:
+ * rate-limited (429)", …) for those reasons. verdictFor passes the popup's OWN answers only: the menu's
+ * may be from before the key was fixed (the 2026-11-25 review).
+ */
+export function openAlexAdvice(failures: string[], keySet: boolean | undefined): string {
+  const oa = failures.filter((f) => f.startsWith('OpenAlex '));
+  if (oa.some((f) => /\((401|403)\)/.test(f))) {
+    return keySet
+      ? "OpenAlex refused the API key in Remzot's settings (OpenAlex API Key): check it at openalex.org/settings/api, or clear it to ask without one."
+      : "OpenAlex refused the request though no key was sent: it may now ask for one. A free key, made at openalex.org/settings/api, goes in Remzot's settings (OpenAlex API Key).";
+  }
+  if (oa.some((f) => f.includes('(429)'))) {
+    return keySet
+      ? "Your OpenAlex key's daily budget may be used up; it starts again at midnight UTC."
+      : "OpenAlex's free daily budget, shared with everyone on your network's IP address, may be used up; it starts again at midnight UTC. A free key in Remzot's settings (OpenAlex API Key) has a budget of its own.";
+  }
+  return '';
 }
 
 // ───────────────────────── The verdict ─────────────────────────
@@ -588,6 +620,11 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
   const freshTotal = fresh.references + fresh.citations + fresh.related;
   const failedNow = src.checks.filter((x) => sourceOutcome(x) === 'failed');
   const allFailed = src.checks.length > 0 && failedNow.length === src.checks.length;
+  // OpenAlex refusing THIS popup's requests just now — a bad key or a used-up daily budget — and what to do
+  // (R-050). Only its own answers count: the menu's refusals may be from before the key was fixed, and then
+  // Refresh is all it takes.
+  const oaAdvice = openAlexAdvice(failedSources(src.checks), s.openAlexKey);
+  const withOA = (todo: string): string => (oaAdvice ? `${todo} ${oaAdvice}` : todo);
 
   if (menuTotal === 0) {
     if (freshTotal > 0) {
@@ -597,7 +634,7 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
         failedThen.length
           ? `When the menu asked (${clock(menu.askedAt)}), these failed: ${failedThen.join('; ')}. Asked again now, the sources answer.`
           : `The sources had nothing when the menu asked (${clock(menu.askedAt)}), but they answer now.`,
-        'Press Refresh.',
+        withOA('Press Refresh.'),
         true
       );
     }
@@ -606,7 +643,7 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
         'error',
         'None of the sources could be reached.',
         failedSources(src.checks).join('; '),
-        'Check your connection, then press Run again in a minute.'
+        withOA('Check your connection, then press Run again in a minute.')
       );
     }
     if (failedNow.length) {
@@ -614,7 +651,7 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
         'warn',
         'Some sources failed, and the rest have nothing for this paper.',
         failedSources(src.checks).join('; '),
-        'Press Run again in a minute.'
+        withOA('Press Run again in a minute.')
       );
     }
     return verdict(
@@ -637,7 +674,7 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
       `The menu shows no ${emptied.map(([name]) => name).join(' or ')}, but the sources give some now.`,
       emptied.map(([name, , now2]) => `${name}: ${n(now2)} now`).join('; ') +
         (failedThen.length ? `. When the menu asked, these failed: ${failedThen.join('; ')}.` : '.'),
-      'Press Refresh.',
+      withOA('Press Refresh.'),
       true
     );
   }
@@ -661,8 +698,20 @@ export function verdictFor(s: CheckState, menu: MenuState | null | undefined, no
       'info',
       'The bar shows works, but some sources failed when the menu asked.',
       `${failedToFix.join('; ')} — their share of the lists is missing.`,
-      'Press Refresh to ask again.',
+      withOA('Press Refresh to ask again.'),
       true
+    );
+  }
+  // The menu's lists came from an earlier answer, but OpenAlex refuses the popup now (a key just entered
+  // wrong, or the budget just used up): its next lookups would lack OpenAlex's part.
+  if (oaAdvice) {
+    return verdict(
+      'warn',
+      "The bar's lists are fine, but OpenAlex refused this popup's requests just now.",
+      `${failedSources(src.checks)
+        .filter((f) => f.startsWith('OpenAlex '))
+        .join('; ')}. The menu's lists came from an earlier answer; its next lookups will lack OpenAlex's part.`,
+      oaAdvice
     );
   }
   return fine();
@@ -751,6 +800,7 @@ export function reportText(s: CheckState, menu: MenuState | null | undefined, v:
   if (src) {
     lines.push('');
     lines.push(`Sources, asked at ${clock(src.startedAt)} about ${src.shown || src.doi}:`);
+    if (s.openAlexKey !== undefined) lines.push(`  (OpenAlex asked ${openAlexKeyText(s.openAlexKey)})`);
     for (const c of src.checks) {
       lines.push(
         `  ${c.name}: ${answerText(c)}${c.statuses.length ? ` [HTTP ${c.statuses.join(', ')}]` : ''} — ${n(c.count)} works, ${duration(c.ms)}`
